@@ -1,0 +1,9 @@
+{
+    // 只做类型检查用（不产出）：比构建用的 tsconfig.json 多收测试文件。
+    // 构建那份把 *.spec.ts 排除掉，避免测试代码进 dist。
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "noEmit": true
+    },
+    "include": ["src/**/*.ts"]
+}

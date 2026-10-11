@@ -1,0 +1,30 @@
+{
+    "name": "kirari-net",
+    "version": "0.1.0",
+    "description": "Kirari 组网层：活锁路由 + PSK 加密 + 主机/叶子角色。桌面端与核心版共用同一份实现。",
+    "license": "MIT",
+    "author": "Aki",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "files": [
+        "dist",
+        "src",
+        "README.md"
+    ],
+    "scripts": {
+        "build": "tsc -p tsconfig.json",
+        "prepare": "npm run build",
+        "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+        "test": "vitest run",
+        "test:watch": "vitest"
+    },
+    "dependencies": {
+        "ws": "^8.22.0"
+    },
+    "devDependencies": {
+        "@types/node": "^24.12.3",
+        "@types/ws": "^8.18.2",
+        "typescript": "~6.0.2",
+        "vitest": "^5.0.3"
+    }
+}
