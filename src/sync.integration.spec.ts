@@ -12,12 +12,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { NetManager } from "./manager";
-import { parsePairingCode } from "./pairingCode";
+import { parseAnyPairingCode } from "./pairingCode";
 import type { ConfigPush, SyncField } from "./protocol";
 import { setNetSecret, isNetEnabled } from "./secure";
 
-// 组网密钥改为**显式注入**后，测试不再需要靠 vitest 的 test.env 抢在模块加载前塞值，
-// 直接在这里给。本包的所有入口（桌面端 / 核心版）也都是这么注入的。
+// 这个文件只关心**配置同步**这一条链路，故意在全局预置一把密钥：
+// 这样主机不必自签、叶子也不必走配对期领取（enroll），直接用同一把密钥握手，
+// 把被测对象（白名单过滤 / 广播下发）从密钥分发里隔离出来。
+// 密钥分发本身由 enroll.integration.spec.ts 专门守。
 setNetSecret("kirari-net-package-test-only-secret");
 
 const tmpDirs: string[] = [];
@@ -76,7 +78,9 @@ describe("组网配置同步（真实两端）", () => {
         expect(started.ok).toBe(true);
 
         const text = host.serializePairing(host.issuePairing());
-        expect(text.startsWith("kirari://connect?d=")).toBe(true);
+        // 默认签发的就是**邀请码**（kirari://join）：不需要对方事先有密钥，
+        // 手上没有密钥的机器因此也能接进来（配对期现领，见 enroll.ts）。
+        expect(text.startsWith("kirari://join?d=")).toBe(true);
 
         const leaf = track(new NetManager(tmpDir("leaf")));
         const joined = await leaf.startFollowing(text);
@@ -93,7 +97,9 @@ describe("组网配置同步（真实两端）", () => {
         host.setAdvertiseHost("10.20.30.40");
         expect((await host.startHosting()).ok).toBe(true);
 
-        const parsed = parsePairingCode(host.serializePairing(host.issuePairing()));
+        const parsedAny = parseAnyPairingCode(host.serializePairing(host.issuePairing()));
+        expect(parsedAny?.kind).toBe("invite");
+        const parsed = parsedAny?.code;
         expect(parsed?.host).toBe("10.20.30.40");
         expect(parsed?.port).toBe(19760);
         // 界面上展示的地址也要跟着走，否则用户看到 A、实际连的是 B

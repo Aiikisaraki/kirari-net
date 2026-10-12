@@ -44,8 +44,12 @@ export const CONNECT_TIMEOUT_MS = 8000;
 export const HANDSHAKE_TIMEOUT_MS = 8000;
 
 /**
- * 配对码格式版本。用于将来扩展字段时区分旧码。
- * 形如：kirari://connect?host=192.168.57.23&port=19760&token=xxx&name=Aki-台式机&exp=1789xxxxxx&v=1
+ * **密文码**的 URL scheme（旧格式，保留兼容）。
+ * 形如：kirari://connect?d=<密文>（整包加密，解它需要本机已有组网密钥）
+ *
+ * ⚠️ 新设备一律发**邀请码** `kirari://join?d=<base64(JSON)>`
+ *    （见 pairingCode.ts 的 `JOIN_SCHEME`）—— 那个**不需要密钥就能解析**，
+ *    是「密钥也能无感分发」的前提。两者统一走 `parseAnyPairingCode()`。
  */
 export const PAIRING_SCHEME = "kirari://connect";
 
@@ -101,6 +105,46 @@ export type HelloAck = {
 };
 
 // ── 客户端 → 主机 ────────────────────────────────────────────────
+
+// ── 配对期密钥下发（enroll，见 enroll.ts）─────────────────────
+//
+// 这两帧刻意走**明文**：此时叶子还没有密钥，没有会话密钥可用于加密。
+// 这段窗口里网络上出现的唯一敏感物就是密封后的密钥，而它只有持有对应
+// 临时私钥的那台叶子解的开（详见 enroll.ts 的安全边界说明）。
+
+/**
+ * 叶子 → 主机：我没有密钥，请把密钥发给我。
+ *
+ * 必须带上一次性邀请口令 —— 没有它，任何人连上端口都能要密钥，那等于不设防。
+ */
+export type EnrollRequest = {
+    type: "enroll_request";
+    v: number;
+    deviceId: string;
+    deviceName: string;
+    /** 邀请码里的一次性口令 */
+    token: string;
+    /** 本机临时公钥（base64），主机用它把密钥密封回本机 */
+    ephPub: string;
+};
+
+/** 主机 → 叶子：密封好的组网密钥（走明文帧，内容本身是密文）。 */
+export type EnrollGrant = {
+    type: "enroll_grant";
+    v: number;
+    /** 主机的临时公钥（base64） */
+    ephPub: string;
+    /** 密封后的组网密钥 */
+    secret: string;
+};
+
+/** 主机 → 叶子：口令不对 / 已用过 / 已过期，不给密钥。 */
+export type EnrollFail = {
+    type: "enroll_fail";
+    v: number;
+    /** 给用户看的大白话 */
+    reason: string;
+};
 
 /** 配对：用一次性配对码换一个长期凭据。 */
 export type PairRequest = {
@@ -193,6 +237,40 @@ export type RelayRequest = {
     images?: string[];
     /** 请求方昵称，仅用于日志与广播显示 */
     nickname?: string;
+    /**
+     * 请求方自带的私人知识库检索结果（可选）。
+     *
+     * 为什么协议要带这个：私人知识库存在**客户端本地**（数据主权在用户），
+     * 主机上没有。叶子发消息前先在自己本地检索好，把结果附上来，
+     * 主机把它当 Layer 1 最高优先级参考注入提示词。
+     * 不带的话「叶子端配了知识库」这件事在上行链路里就**静默失效**了 ——
+     * 症状很隐蔽：本地聊得好好的，一进组网回答就变差，还没任何报错。
+     */
+    kbContext?: KbPassage[];
+    /**
+     * 请求方想要**逐字流式**回复。
+     *
+     * 主机执行模型时会把正文增量用 relay_delta 帧**单播**给请求方（不广播，
+     * 别的设备只等最终的 relay_result）。主机版本旧 / 不支持时直接忽略这个
+     * 标志 —— 请求方拿不到 delta 就等整包，行为与以前完全一样，双向向后兼容。
+     */
+    stream?: boolean;
+};
+
+/**
+ * 一条检索到的知识片段。
+ * 字段与两端的知识库实现保持一致（桌面端 RetrievedPassage / 核心版 kbContext），
+ * 只挑链路上真正用得到的几个，别的（tier / priority 等）不上网络。
+ */
+export type KbPassage = {
+    /** 片段正文（纯文本） */
+    text: string;
+    /** 来源名（给人看的，会进提示词的「（来源：…）」） */
+    source?: string;
+    /** 出处链接 */
+    url?: string;
+    /** 相关度（0~1） */
+    score?: number;
 };
 
 /** 主机 → 全网：生成好的回复。 */
@@ -211,6 +289,25 @@ export type RelayResult = {
     sessionId: string;
     /** 发起时刻（毫秒），广播里带着，各端算延迟方便排查 */
     askedAt: number;
+};
+
+/** 主机 → 请求方：正文的流式增量（仅单播给请求方，不广播）。
+ *
+ * 与 relay_result 的关系：delta 只是「先睹为快」的增量，**权威内容仍是
+ * relay_result.speech**。请求方即使一条 delta 都没收到（主机旧版本 / 中途
+ * 断连）也必须能只靠 result 正常工作。
+ *
+ * 为什么不广播：别的设备对这次生成的中间过程没有兴趣，广播只会白烧带宽；
+ * 而且中间碎片可能被工具轮作废（reset），拿去展示反而添乱。
+ */
+export type RelayDelta = {
+    type: "relay_delta";
+    v: number;
+    requestId: string;
+    /** 正文增量。与 reset 互斥。 */
+    text?: string;
+    /** true = 之前流出的内容作废（模型转去调工具了 / 换了收尾路径），清空重流 */
+    reset?: boolean;
 };
 
 /** 主机 → 请求方：主机忙不过来（队列满 / 正在关停）。 */
@@ -274,12 +371,15 @@ export type ServerFrame =
     | PongMessage
     | MembersMessage
     | HostShutdown
+    | EnrollGrant
+    | EnrollFail
     | RelayResult
+    | RelayDelta
     | RelayBusy
     | RelayBackfillAck
     | ConfigPush
     | HelloAck;
-export type ClientFrame = Hello | PairRequest | PingMessage | RelayRequest | RelayBackfill | ConfigReport;
+export type ClientFrame = Hello | EnrollRequest | PairRequest | PingMessage | RelayRequest | RelayBackfill | ConfigReport;
 
 /** 解析服务端发来的文本帧。非法 JSON / 缺 type 一律返回 null（不抛）。 */
 export function parseServerFrame(raw: unknown): ServerFrame | null {

@@ -14,10 +14,11 @@ import * as os from "node:os";
 import { NET_PORT, PROTOCOL_VERSION, parseClientFrame } from "./protocol";
 import type { Hello, HelloAck } from "./protocol";
 import { isNetEnabled, getNetSecret, deriveKey, newSalt, seal, open, ReplayGuard } from "./secure";
-import type { MembersMessage, PairResponse, PongMessage, HostShutdown, RelayRequest, RelayBackfill, RelayBusy, ConfigReport, ClientFrame } from "./protocol";
+import type { MembersMessage, PairResponse, PongMessage, HostShutdown, RelayRequest, RelayBackfill, RelayBusy, ConfigReport, ClientFrame, EnrollRequest } from "./protocol";
 import { filterWhitelisted } from "./netStore";
 import type { SyncField } from "./protocol";
 import { randomToken, verifyPairing } from "./pairingCode";
+import { sealSecretFor } from "./enroll";
 import type { NetState, LeafCredential } from "./netStore";
 import { rememberLeaf, removeMember } from "./netStore";
 
@@ -366,6 +367,47 @@ export class HostServer {
         }, 10000);
 
         /**
+         * 处理「我没有密钥，请把密钥给我」的请求。
+         *
+         * 三道闸缺一不可，顺序也不能乱：
+         *   1. 本机自己得有密钥 —— 没有的话说明这台机器本来就没开组网
+         *   2. 必须出示有效的**一次性邀请口令**（用过作废 / 过期作废 / 可撤销）
+         *   3. 口令过关才用对方的临时公钥把密钥密封回去
+         * 任何一道不过都只回一句大白话，不告诉对方「你猜对了第几关」。
+         */
+        const handleEnroll = (req: EnrollRequest): void => {
+            const deviceId = String(req.deviceId || "").trim();
+            const token = String(req.token || "").trim();
+            const ephPub = String(req.ephPub || "").trim();
+            const fail = (reason: string): void => {
+                this.events.onLog?.(`[net] 拒绝密钥下发：${reason}`);
+                this.sendTo(ws, { type: "enroll_fail", v: PROTOCOL_VERSION, reason });
+            };
+
+            if (!isNetEnabled()) {
+                fail("这台主机还没开组网");
+                return;
+            }
+            if (!deviceId || !token || !ephPub) {
+                fail("邀请码信息不完整，整串重新复制一次");
+                return;
+            }
+            // ⚠️ 这里是唯一发放密钥的地方。口令不有效，一个字节都不给。
+            const err = verifyPairing(this.state.pairings, token, deviceId);
+            if (err) {
+                fail(err.error);
+                return;
+            }
+            try {
+                const grant = sealSecretFor(ephPub, getNetSecret());
+                this.sendTo(ws, { type: "enroll_grant", v: PROTOCOL_VERSION, ephPub: grant.ephPub, secret: grant.sealed });
+                this.events.onLog?.(`[net] 已向 ${deviceId.slice(0, 8)} 下发组网密钥（凭一次性邀请码）`);
+            } catch (e) {
+                fail(`这台设备给出的临时公钥没法用：${(e as Error)?.message || "未知错误"}`);
+            }
+        };
+
+        /**
          * 处理明文 hello：派生会话密钥、回 hello_ack。
          *
          * 密钥不在网络上传输 —— 两边各自用同一串密钥 + 主机的 salt 算出来。
@@ -409,6 +451,15 @@ export class HostServer {
 
         ws.on("message", (data: unknown) => {
             const raw = typeof data === "string" ? data : String(data);
+
+            // ── 路径 0：密钥下发（enroll）—— 叶子手上还没有密钥时走这里 ──
+            // 必须在 hello 之前处理：这条路径的设备根本没有会话密钥，
+            // 不可能走加密帧，也派生不出会话密钥。
+            const early = parseClientFrame(raw) as (ClientFrame & { type: string }) | null;
+            if (early && early.type === "enroll_request") {
+                handleEnroll(early as unknown as EnrollRequest);
+                return;
+            }
 
             // ── 路径 1：明文握手 ──
             const plain = parseClientFrame(raw) as (ClientFrame & { type: string }) | null;

@@ -8,8 +8,11 @@
 // ⚠️ 本层**不得 import electron** —— 一旦引入，核心版就用不了了。
 //    Electron 专属的接线（IPC / 二维码渲染）留在桌面端自己的 electron/net/ipc.ts。
 //
-// 密钥注入：见 secure.ts 的 setNetSecret()。这里不做任何「编译期魔法」，
-// 因为本包是**预先编译**的产物，打包器的 define 够不到（详见 secure.ts 的说明）。
+// 密钥：本层**不含任何密钥**，两端也不预置。
+//   谁要用谁在运行时拿到 —— 当主机就自己签一把（NetManager 默认自动签发），
+//   当叶子就凭一张邀请码在配对那一刻向主机领（enroll）。详见 secure.ts。
+//   两个宿主都不需要写密钥相关的代码，接上 NetManager 即可。
+//   唯一例外是测试：它用 setNetSecret() 显式塞一把，把密钥分发本身隔离掉。
 
 export * from "./protocol";
 export * from "./secure";

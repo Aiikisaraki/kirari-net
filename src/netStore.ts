@@ -1,7 +1,7 @@
 // kirari-net · src/netStore.ts
 // 组网状态的持久化。
 //
-// 落实 ARCHITECTURE-PLAN 5.6「退出不清除」这条铁律：
+// 落实 ARCHITECTURE-PLAN 5.7「退出不清除」这条铁律：
 // 主机地址、端口、长期凭据、自己的角色、配对码列表，**一律只存不清**。
 // 用户关掉组网开关 = 暂停参与；下次打开凭这些信息自动归位，不需要重新配对。
 //
@@ -64,6 +64,20 @@ export type NetState = {
     credential?: string;
     /** 配对码里承诺的主机名（仅展示） */
     hostDisplayName?: string;
+
+    /**
+     * 本机签发/保管的组网密钥。
+     *
+     * 两种来源：
+     *  - `ownSecret`：本机第一次当主机时临时生成的（源码里不带任何密钥，
+     *    也从源码里导出不来 —— 它就是这台机器自己的秘密）
+     *  - `enrolledSecret`：本机当叶子时，主机在配对那一刻加密发过来的
+     *
+     * 落盘是**必需**的：不然每次重连都要重新配对。这个文件权限收紧到 600，
+     * 且这两个字段**绝不出现在 snapshot() 里**（界面、组网同步都不知道有它）。
+     */
+    ownSecret?: string;
+    enrolledSecret?: string;
 };
 
 const FILE_NAME = "net-state.json";
@@ -112,7 +126,8 @@ export function saveNetState(userDataDir: string, state: NetState): void {
     const tmp = `${file}.tmp`;
     try {
         fs.mkdirSync(userDataDir, { recursive: true });
-        fs.writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
+        // 600：这个文件里可能躺着组网密钥与长期凭据。
+        fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: "utf8", mode: 0o600 });
         fs.renameSync(tmp, file);
     } catch (e) {
         console.warn("[net] 组网状态写入失败:", (e as Error)?.message || e);
@@ -202,6 +217,35 @@ export function detachFromHost(state: NetState): NetState {
         hostDisplayName: undefined,
         credential: undefined,
     };
+}
+
+/**
+ * 本机自己签发一把组网密钥（第一次当主机、手上还没有任何密钥时）。
+ * 有了它，「从源码构建 / 用 docker 跑」的人也能组自己的网 —— 不用先知道密钥。
+ */
+export function setOwnSecret(state: NetState, secret: string): NetState {
+    return { ...state, ownSecret: secret };
+}
+
+/** 叶子侧记下从主机 enroll 学到的密钥。值没变就返回同一个对象（避免调用方无谓写盘）。 */
+export function setEnrolledSecret(state: NetState, secret: string): NetState {
+    if (state.enrolledSecret === secret) return state;
+    return { ...state, enrolledSecret: secret };
+}
+
+/**
+ * 本机该用哪把组网密钥（不含宿主环境变量注入的那把 —— 那个由宿主负责判断优先级）。
+ * 叶子优先用连进来学到的（就是当前这个网的），其次用自己签的。
+ */
+export function storedSecret(state: NetState): string | undefined {
+    return state.enrolledSecret || state.ownSecret || undefined;
+}
+
+/** 叶子侧彻底退出某个网：连从它那里学到的密钥一起忘掉（否则下次还会滑回那个网）。 */
+export function forgetEnrolledSecret(state: NetState): NetState {
+    const next = { ...state, enrolledSecret: undefined };
+    delete next.enrolledSecret;
+    return next;
 }
 
 /** 设置主机侧同步白名单。叶子侧调用会被忽略（白名单只在主机生效）。 */

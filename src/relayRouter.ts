@@ -17,7 +17,7 @@
 // 所以组网层可以独立测试，core 也能塞进不同的执行器。
 
 import { PROTOCOL_VERSION } from "./protocol";
-import type { RelayRequest, RelayResult, RelayBackfill } from "./protocol";
+import type { RelayRequest, RelayResult, RelayBackfill, KbPassage } from "./protocol";
 
 /**
  * 执行器：拿到一条上行请求，返回一段回复。
@@ -29,6 +29,19 @@ export type RelayExecutor = (req: {
     images: string[];
     deviceId: string;
     nickname?: string;
+    /**
+     * 请求方自带的私人知识库检索结果（可选，可能为空数组）。
+     * 主机应把它当最高优先级参考注入提示词 —— 它来自叶子本地，
+     * 主机这边没有别的途径拿到。
+     */
+    kbContext?: KbPassage[];
+    /**
+     * 正文逐字回调（仅请求方带 stream 标志时提供）。
+     * 约定与两端内核一致：onDelta(text) 追加增量；onDelta(null) 表示之前流出的
+     * 作废（模型转去调工具了），由路由转发为 relay_delta{reset:true} 让请求方清空。
+     * 回调异常由执行器自己吞掉，不能影响生成。
+     */
+    onDelta?: (chunk: string | null) => void;
 }) => Promise<{ speech: string; emotion?: string | null }>;
 
 export type RelayRouterEvents = {
@@ -54,6 +67,37 @@ type QueueItem = {
     req: RelayRequest;
     enqueuedAt: number;
 };
+
+/** 单条知识片段的正文上限（字符）。提示词空间有限，超长的片段截断比照单全收诚实。 */
+const KB_PASSAGE_MAX_CHARS = 2000;
+/** 一条请求最多带几条片段。叶子端本来也只检索 top 5。 */
+const KB_PASSAGE_MAX_COUNT = 5;
+
+/**
+ * 收敛叶子上带来的知识片段：只留认识的字段、去掉空正文、限条数与长度。
+ *
+ * 为什么不照单全收：这是**别的设备**发来的内容，会被拼进主机的提示词。
+ * 不设上限的话，一个异常（或恶意）的叶子就能用超大 kbContext 把主机的
+ * 上下文窗口撑爆、把主机的额度烧光。
+ */
+function clampKbContext(passages: unknown): KbPassage[] | undefined {
+    if (!Array.isArray(passages)) return undefined;
+    const out: KbPassage[] = [];
+    for (const raw of passages) {
+        if (!raw || typeof raw !== "object") continue;
+        const p = raw as Partial<KbPassage>;
+        const text = typeof p.text === "string" ? p.text.trim().slice(0, KB_PASSAGE_MAX_CHARS) : "";
+        if (!text) continue;
+        out.push({
+            text,
+            source: typeof p.source === "string" ? p.source.slice(0, 80) : undefined,
+            url: typeof p.url === "string" ? p.url.slice(0, 500) : undefined,
+            score: typeof p.score === "number" && p.score >= 0 && p.score <= 1 ? p.score : undefined,
+        });
+        if (out.length >= KB_PASSAGE_MAX_COUNT) break;
+    }
+    return out.length ? out : undefined;
+}
 
 export class RelayRouter {
     private executor: RelayExecutor;
@@ -162,6 +206,18 @@ export class RelayRouter {
     private async process(item: QueueItem): Promise<void> {
         const { req } = item;
         const waitMs = Date.now() - item.enqueuedAt;
+        // 流式：请求方要了 stream 才把 onDelta 递给执行器；增量单播给请求方（不广播）。
+        // 旧版主机没有这段逻辑 → 请求方一条 delta 都收不到、只等 result，行为不变。
+        const onDelta = req.stream
+            ? (chunk: string | null) => {
+                  this.events.replyTo(req.deviceId, {
+                      type: "relay_delta",
+                      v: PROTOCOL_VERSION,
+                      requestId: req.requestId,
+                      ...(chunk === null ? { reset: true } : { text: chunk }),
+                  });
+              }
+            : undefined;
         try {
             const out = await this.executor({
                 sessionId: req.sessionId,
@@ -169,6 +225,8 @@ export class RelayRouter {
                 images: Array.isArray(req.images) ? req.images : [],
                 deviceId: req.deviceId,
                 nickname: req.nickname,
+                kbContext: clampKbContext(req.kbContext),
+                onDelta,
             });
             const speech = (out?.speech || "").trim();
             if (!speech) {

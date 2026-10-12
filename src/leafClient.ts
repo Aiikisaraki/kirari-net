@@ -20,8 +20,10 @@ import {
     PROTOCOL_VERSION,
     SeqTracker,
 } from "./protocol";
-import type { MembersMessage, RelayResult, RelayBusy, RelayBackfill, ConfigPush, SyncField, HelloAck } from "./protocol";
-import { isNetEnabled, getNetSecret, deriveKey, seal, open, ReplayGuard } from "./secure";
+import type { MembersMessage, RelayResult, RelayBusy, RelayBackfill, ConfigPush, SyncField, HelloAck, KbPassage, RelayDelta, EnrollGrant } from "./protocol";
+import { isNetEnabled, getNetSecret, deriveKey, seal, open, ReplayGuard, setNetSecret } from "./secure";
+import { newEnrollKeypair, openSecretOwnPair } from "./enroll";
+import type { EnrollKeypair } from "./enroll";
 import { randomBytes } from "crypto";
 
 export type LeafStatus = "idle" | "connecting" | "paired" | "connected" | "fallback";
@@ -41,8 +43,21 @@ export type LeafEvents = {
     onRelayResult?: (frame: RelayResult) => void;
     /** 主机拒绝了这次请求（排队满 / 正在关停） */
     onRelayBusy?: (frame: RelayBusy) => void;
+    /**
+     * 流式增量（仅本机上行且带 stream 标志时，主机才会单播过来）。
+     * frame.reset=true 表示之前收到的增量作废，应清空重流。
+     * 权威内容仍是 onRelayResult 的 speech —— 一条 delta 都没收到也要能正常工作。
+     */
+    onRelayDelta?: (frame: RelayDelta) => void;
     /** 主机下发了配置（白名单内的字段），写进本机即生效 */
     onConfigPush?: (frame: ConfigPush) => void;
+    /**
+     * 配对期从主机学到了组网密钥。
+     *
+     * 宿主（桌宠 / 核心版）必须把它落盘 —— 否则下次重启又没密钥了，
+     * 只能重新配对。这也是「第一次贴码之后永久免维护」得以成立的那一步。
+     */
+    onSecretLearned?: (secret: string) => void;
     onLog?: (message: string) => void;
 };
 
@@ -89,6 +104,16 @@ export class LeafClient {
     private rxGuard = new ReplayGuard();
     /** 首次配对用的连接码（握手完成后发出一次即清空） */
     private pendingToken = "";
+    /**
+     * 本轮是否需要「先要密钥再握手」。
+     *
+     * 为真表示这台设备手上没有组网密钥（从源码跑起来 / docker 起来的核心版最常见），
+     * 连接建立后第一帧要发的不是 hello，而是 enroll_request ——
+     * 拿到密钥之后才轮到原本那套握手。
+     */
+    private needEnroll = false;
+    /** enroll 用的临时密钥对。只在等密钥那几秒里有值，用完立刻清掉。 */
+    private enrollKeys: EnrollKeypair | null = null;
     /** 配对结果：由 attachMessage 的 pair_ok / pair_fail 分支落定，pair() 轮询取走 */
     private pairResult: { ok: true; credential: string } | { ok: false; error: string } | null = null;
 
@@ -258,13 +283,29 @@ export class LeafClient {
      *    表现就是「配对成功但组网毫无反应」。新增连接逻辑时改一处就够。
      *
      * @param code 解析好的连接码（见 pairingCode.parsePairingCode）
+     * @param opts.enroll true = 手里没有密钥，先向主机要一把（源泉式接入）
      */
-    async pair(code: { host: string; port: number; token: string; name: string }): Promise<
-        { ok: true; credential: string } | { ok: false; error: string }
-    > {
-        if (!isNetEnabled()) {
+    async pair(
+        code: { host: string; port: number; token: string; name: string },
+        opts: { enroll?: boolean } = {},
+    ): Promise<{ ok: true; credential: string } | { ok: false; error: string }> {
+        // 没有密钥时不能一上来就判死：只要同时带来了一个能证明身份的一次性口令，
+        // 就可以先 enroll 拿密钥。反过来，既没密钥又不许 enroll，才真的连不了。
+        if (!isNetEnabled() && !opts.enroll) {
             return { ok: false, error: "这个版本没有包含组网密钥，无法接入" };
         }
+        if (!code.token) {
+            return { ok: false, error: "连接码里没有接入口令，重新向主机要一个" };
+        }
+        /**
+         * ⚠️ opts.enroll 显式为真时**覆盖**本机既有的密钥。
+         *
+         * 这一点必须无条件执行：本机可能正带着某个网的密钥（自己签的、或之前学来的），
+         * 而用户现在要接的是**另一个**网。若「已经有密钥就不 enroll」，
+         * 这把设备会拿着错误的密钥去握手，永远连不上 —— 正是「两头密钥对不上」的死结。
+         * 所以：邀请码 = 「接进提出这个码的那个网」，与原先带着哪把无关。
+         */
+        this.needEnroll = opts.enroll === true || !isNetEnabled();
         this.host = code.host;
         this.port = code.port;
         // 握手完成后由 attachMessage 里的 handshake_ok 分支发出这个码
@@ -295,6 +336,14 @@ export class LeafClient {
         if (!host || !port || !credential) {
             this.setStatus("idle");
             this.events.onFallback?.("还没连过主机，先填一个连接码");
+            return;
+        }
+        // 有凭据却没有密钥 = 状态不完整（例如密钥文件被删/换了机器）。
+        // 这时候硬连会卡在「密钥协商超时」，用户完全不知道发生了什么，
+        // 不如直接说清楚该做什么。
+        if (!isNetEnabled()) {
+            this.events.onLog?.("[net] 本机没有组网密钥，无法用旧凭据重连");
+            this.fallback("这台机器上没有组网密钥了，重新用主机给的邀请码接一次");
             return;
         }
         this.host = host;
@@ -337,6 +386,13 @@ export class LeafClient {
             // （原先这里 re-arm 的是建连超时，而它一进来就 readyState !== 0 直接
             //  返回，等于握手阶段没有任何超时保护，见 protocol.ts 的说明。）
             this.armHandshakeTimeout(ws, gen);
+
+            // ── 手上没有密钥：先向主机要一把，再走常规握手 ──
+            if (this.needEnroll) {
+                this.sendEnrollRequest(ws);
+                return;
+            }
+
             // 第一帧永远是明文 hello：主机用它回 salt，两边各自算出同一个会话密钥。
             // 密钥本身不上网络 —— 抓到包的人看不到它。
             this.sendRaw(ws, {
@@ -352,6 +408,57 @@ export class LeafClient {
         // 断线回退统一交给 attachLifecycle，避免同一连接注册两份 handler
         // （重复注册会让 fallback 触发两次，用户收到两条一样的提示）。
         this.attachLifecycle(ws, gen);
+    }
+
+    /**
+     * 发出「请把密钥给我」的请求。
+     *
+     * 临时密钥对是**每次重来都新建**的：同一台设备反复尝试也不会复用上一次的私钥，
+     * 所以别人录到的密文在自己这里是解不开的（他从别处重放的旧公钥也换不来密钥）。
+     */
+    private sendEnrollRequest(ws: WebSocket): void {
+        this.enrollKeys = newEnrollKeypair();
+        this.setStatus("connecting", "正在向主机索取密钥");
+        this.sendRaw(ws, {
+            type: "enroll_request",
+            v: PROTOCOL_VERSION,
+            deviceId: this.deviceId,
+            deviceName: this.deviceName,
+            token: this.pendingToken || this.credential,
+            ephPub: this.enrollKeys.publicKeyB64,
+        });
+    }
+
+    /**
+     * 收到加密的组网密钥：解开 → 装上 → 通知宿主落盘 → 接着走常规握手。
+     *
+     * 解不开只有一种可能（对方给的临时公钥和本机私钥对不上，或密文被改动），
+     * 这时干净地回退：不留半截状态，用户看到的是「这次没接上」而不是卡住。
+     */
+    private handleEnrollGrant(ws: WebSocket, frame: EnrollGrant): void {
+        const keys = this.enrollKeys;
+        const secret = keys ? openSecretOwnPair(keys, String(frame.ephPub || ""), String(frame.secret || "")) : null;
+        if (!secret) {
+            this.enrollKeys = null;
+            this.events.onLog?.("[net] 主机发来的密钥解不开，请让它重新生成一个邀请码");
+            this.pairResult = { ok: false, error: "主机发来的东西没法用，让它重新生成一个邀请码试试" };
+            this.fallback("和主机没对上号，接不进去");
+            return;
+        }
+        // 临时密钥对用完即弃：它的唯一用途就是这一次的密钥下发
+        this.enrollKeys = null;
+        this.needEnroll = false;
+        setNetSecret(secret);
+        // 交给宿主落盘 → 之后重连用这把，不用再走一次 enroll
+        this.events.onSecretLearned?.(secret);
+        this.events.onLog?.("[net] 已拿到组网密钥，开始密钥协商");
+        this.sendRaw(ws, {
+            type: "hello",
+            v: PROTOCOL_VERSION,
+            deviceId: this.deviceId,
+            deviceName: this.deviceName,
+            nonce: randomBytes(8).toString("hex"),
+        });
     }
 
     /**
@@ -375,6 +482,20 @@ export class LeafClient {
 
             // 收到任何帧都算「对方活着」，重置半开计时
             this.armPongTimeout();
+
+            // ── 密钥下发的结果（明文帧，见 enroll.ts）──
+            if (frame.type === "enroll_grant") {
+                this.handleEnrollGrant(ws, frame as EnrollGrant);
+                return;
+            }
+            if (frame.type === "enroll_fail") {
+                const why = frame.reason || "主机没有接受这台设备";
+                this.enrollKeys = null;
+                this.events.onLog?.(`[net] 拿不到密钥：${why}`);
+                this.pairResult = { ok: false, error: why };
+                this.fallback(why);
+                return;
+            }
 
             // ── 握手完成：现在才发身份、启动心跳 ──
             if (frame.type === "handshake_ok") {
@@ -445,6 +566,11 @@ export class LeafClient {
             }
             if (frame.type === "relay_busy") {
                 this.events.onRelayBusy?.(frame as RelayBusy);
+                return;
+            }
+            if (frame.type === "relay_delta") {
+                // 主机的流式增量。旧版主机永远不会发这个类型 —— 不处理也不影响别的功能。
+                this.events.onRelayDelta?.(frame as RelayDelta);
                 return;
             }
             if (frame.type === "config_push") {
@@ -561,12 +687,22 @@ export class LeafClient {
      *
      * @param sessionId 本机的会话 ID —— 主机据此取上下文，所以每台设备
      *        的对话脉络互不串味，且重连后上下文还在（存在主机那边）。
+     * @param kbContext 本机私人知识库的检索结果（可选）。私人知识库存在本机，
+     *        主机看不到它 —— 不带的话「本机配了知识库」在上行链路里就静默失效了。
+     *        失败/为空就不带，不要因此阻塞发送。
      * 返回**本次请求的 requestId**（发不出去时返回 null）。
      * 必须把 requestId 交出去：服务端形态的叶子（kirari-core）是「请求—响应」的，
      * 拿到一条消息就得给出对应回复，没有界面去接广播 —— 它需要按 requestId
      * 精确等到自己那条回包。见 NetManager.relayAndWait()。
      */
-    sendRelay(content: string, sessionId: string, images?: string[], nickname?: string): string | null {
+    sendRelay(
+        content: string,
+        sessionId: string,
+        images?: string[],
+        nickname?: string,
+        kbContext?: KbPassage[],
+        stream?: boolean,
+    ): string | null {
         const ws = this.ws;
         if (!ws || ws.readyState !== 1 || !this.sessionKey) return null;
         const requestId = this.nextRequestId();
@@ -579,6 +715,9 @@ export class LeafClient {
             content,
             images,
             nickname,
+            kbContext: Array.isArray(kbContext) && kbContext.length ? kbContext : undefined,
+            // 只有调用方要流式才带标志：旧主机不认识就忽略，请求退化为「等整包」
+            stream: stream ? true : undefined,
         });
         return sent ? requestId : null;
     }

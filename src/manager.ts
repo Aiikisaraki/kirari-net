@@ -34,18 +34,19 @@ import {
 import type { NetState, NetRole } from "./netStore";
 import {
     generatePairingCode,
-    parsePairingCode,
+    parseAnyPairingCode,
+    serializeInviteCode,
     serializePairingCode,
     describeRemaining,
     randomToken,
 } from "./pairingCode";
 import type { PairingCode, ExpiryKey } from "./pairingCode";
 import { NET_PORT, PROTOCOL_VERSION, SYNC_FIELDS } from "./protocol";
-import type { RelayResult, RelayBusy, RelayBackfill, ConfigPush, SyncField } from "./protocol";
+import type { RelayResult, RelayBusy, RelayDelta, RelayBackfill, ConfigPush, SyncField, KbPassage } from "./protocol";
 import { RelayRouter } from "./relayRouter";
-import { isNetEnabled } from "./secure";
 import type { RelayExecutor } from "./relayRouter";
-
+import { isNetEnabled, setNetSecret, newNetSecret } from "./secure";
+import { setEnrolledSecret, setOwnSecret, storedSecret, forgetEnrolledSecret } from "./netStore";
 export type NetSnapshot = {
     role: NetRole;
     deviceId: string;
@@ -80,6 +81,13 @@ export type NetManagerEvents = {
     onRelayResult?: (frame: RelayResult) => void;
     /** 主机拒绝了请求 */
     onRelayBusy?: (frame: RelayBusy) => void;
+    /**
+     * 流式增量（本机上行且请求了 stream 时，主机单播回来的正文增量）。
+     * frame.reset=true 表示之前收到的作废，应清空重流。
+     * 权威内容仍是 onRelayResult 的 speech —— 一条 delta 都没收到也必须能正常工作
+     * （旧版主机不认识 stream 标志，一条都不会发）。
+     */
+    onRelayDelta?: (frame: RelayDelta) => void;
     /**
      * 配置被组网同步：主机侧是「批准叶子改动后应用到本机」，
      * 叶子侧是「收到主机下发后应用」。两者都落到同一个回调。
@@ -119,12 +127,94 @@ export class NetManager {
         string,
         { settle: (out: { ok: true; frame: RelayResult } | { ok: false; reason: string }) => void; timer: ReturnType<typeof setTimeout> }
     >();
+    /**
+     * 流式增量的投递目标：requestId → 回调。
+     * relayAndWait(onDelta) 注册、settle（成功/超时）时注销。
+     * 不在表里的 delta（fire-and-forget 的 relay() 没注册）直接丢弃 ——
+     * 那种调用方式本来就不消费增量，攒着只会白占内存。
+     */
+    private pendingDeltas = new Map<string, (chunk: string | null) => void>();
+
+    /**
+     * 允许「本机没有密钥时，自己签一把」。
+     *
+     * **默认开启，且桌宠端与核心版行为完全一致**（能力对等是硬约束）：
+     * 任何一份安装 —— 不管是我打的包、别人 fork 出来的、还是 docker 起的核心版 ——
+     * 都能零配置起一个属于自己的网。签出来的是这台机器自己的随机数，
+     * 谁也拿不到谁的上游：这里从来不读别人的密钥。
+     *
+     * 想做成「这个发行版不许组网」的部署者，可以显式调 setAutoProvisionSecret(false)。
+     */
+    private autoProvision = true;
 
     constructor(userDataDir: string, events: NetManagerEvents = {}) {
         this.userDataDir = userDataDir;
         this.events = events;
         this.identity = loadOrCreateIdentity(userDataDir);
         this.state = loadNetState(userDataDir, this.identity.deviceId, this.identity.name);
+        /**
+         * 密钥来源的优先级（定死，别再翻来覆去）：
+         *   1. **本机主动加入过的那个网**（enrolledSecret）—— 用户亲手贴码换来的，
+         *      意图最明确，压过其它一切来源；否则退出一个网之后又会滑回旧的那个。
+         *   2. 宿主已经装上的那把（应用层自己调 setNetSecret 设的；两端产品都不再预置）
+         *   3. 本机自己签的（ownSecret）—— 本机第一次当主机时生成的
+         *
+         * 于是两端彻底对等：源码里、构建产物里、配置文件里都**没有**密钥，
+         * 每台机器要么自己签一把（当主机），要么凭一张邀请码领一把（当叶子）。
+         */
+        const learned = this.state.enrolledSecret;
+        if (learned) {
+            setNetSecret(learned);
+        } else if (!isNetEnabled() && this.state.ownSecret) {
+            setNetSecret(this.state.ownSecret);
+        }
+    }
+
+    /**
+     * 设置「本机手上没有密钥时，是否允许自己签一把」。默认开启，两端一致。
+     *
+     * 只有「我不希望这份发行版能开组网」的部署者才需要显式关掉：
+     * `setAutoProvisionSecret(false)`。关掉之后，这台机器只能靠配对期
+     * 从主机领密钥，自己开不了网。
+     */
+    setAutoProvisionSecret(enabled: boolean): void {
+        this.autoProvision = enabled === true;
+    }
+
+    /**
+     * 这台设备现在能不能开组网。UI 用它决定「组网」那一块要不要灰掉。
+     *
+     * ⚠️ 别拿 `isNetEnabled()` 当这个判断用。以前它等价于「这个构建带没带密钥」，
+     *    但现在两端都**不预置密钥**，一台刚装好的机器 isNetEnabled() 必然是 false，
+     *    而它其实完全可以自己开一个网 —— 拿它当开关可用性，会把整套组网设置
+     *    灰掉，用户连「开启组网」都点不了，自签也就永远走不到。
+     *
+     * 判据与 ensureSecret() 完全一致，只是不产生副作用。
+     */
+    canStartNetworking(): boolean {
+        return isNetEnabled() || !!storedSecret(this.state) || this.autoProvision;
+    }
+
+    /**
+     * 确保手上有一把能用的密钥。
+     * 返回值说明：true = 现在有密钥了（原本就有、或从文件/新签发得到）。
+     */
+    private ensureSecret(): boolean {
+        if (isNetEnabled()) return true;
+        const saved = storedSecret(this.state);
+        if (saved) {
+            setNetSecret(saved);
+            return true;
+        }
+        if (!this.autoProvision) return false;
+        // 第一把：本机自己签。签发完立即落盘，之后就一直用这一把
+        // （同一个网的密钥必须稳定，不然之前接进来的设备会突然对不上）。
+        const fresh = newNetSecret();
+        setNetSecret(fresh);
+        this.state = setOwnSecret(this.state, fresh);
+        this.persist();
+        this.log("[net] 本机手上还没有密钥，已自动签发一把（只存在本机）");
+        return true;
     }
 
     /**
@@ -267,9 +357,10 @@ export class NetManager {
         ok: true;
         code: PairingCode;
     } | { ok: false; error: string }> {
-        // 没有组网密钥就不给开 —— 「必须设密码才能开组网」的落地点。
-        // 这样 fork 后自行构建的人拿不到密钥，产物里的组网是关的。
-        if (!isNetEnabled()) {
+        // 密钥优先用宿主注入的那把；没有就用本机上次攒下的、或自己签的那把。
+        // 都不行（宿主既没注入、也没打开自动签发）才退回「这个版本开不了组网」——
+        // 从别人源码构建出来的人因此依然拿不到任何人的密钥，行为与以前一致。
+        if (!this.ensureSecret()) {
             return { ok: false, error: "这个版本没有包含组网密钥，无法开启组网" };
         }
         this.state = enableNetworking(this.state, "host");
@@ -329,45 +420,69 @@ export class NetManager {
     }
 
     /**
+     * 造一个叶子客户端（首次配对与重连共用同一份事件接线）。
+     *
+     * ⚠️ 两条路径必须用**同一份**：以前各写一份，结果「刚配对上的设备」漏了
+     *    消息处理 handler，配对成功之后心跳、成员、回复全都接不到。
+     */
+    private createLeaf(): LeafClient {
+        return new LeafClient(this.identity.deviceId, this.identity.name, {
+            onLog: (m) => this.log(m),
+            onStatus: () => this.events.onSnapshot?.(this.snapshot()),
+            onMembers: () => this.events.onSnapshot?.(this.snapshot()),
+            onRelayResult: (f) => this.dispatchRelayResult(f),
+            onRelayBusy: (f) => this.dispatchRelayBusy(f),
+            onRelayDelta: (f) => this.dispatchRelayDelta(f),
+            onConfigPush: (f) => this.events.onConfigPush?.(f),
+            // 配对期从主机学到的密钥：立刻落盘。
+            // 少了这一步，重启后又变回「没有密钥的机器」，只能重新贴码 ——
+            // 「贴一次码，永久无感」就断了。
+            onSecretLearned: (secret) => {
+                this.state = setEnrolledSecret(this.state, secret);
+                this.persist();
+            },
+            onFallback: (reason) => {
+                // 关键：只改 role，不动地址与凭据 —— 退出不清除。
+                // 下次用户打开开关，凭持久化的信息自动归位，无需重新配对。
+                this.state = disableNetworking(this.state);
+                this.persist();
+                this.events.onFallbackNotice?.(
+                    `已退出组网（${reason}），现在可以独立工作。主机那边重新打开组网后，这里打开开关就能自动接回去，不用重新配对。`,
+                );
+            },
+        });
+    }
+
+    /**
      * 开启组网并作为叶子：填入连接码完成配对。
      * 配对成功会把主机地址与长期凭据一并落盘，下次打开开关直接连、免重新配对。
+     *
+     * 两种码：
+     *  - 邀请码（kirari://join，默认签发）：**本机有没有密钥都能接**。
+     *    没有密钥时先在配对那一步向主机索要（enroll），拿到后一切照旧。
+     *  - 密文码（kirari://connect，旧格式）：需要本机本来就有同一把密钥 ——
+     *    这条路径是给老客户端留的，不改变它「知道密钥才能解」的语义。
      */
     async startFollowing(pairingText: string): Promise<{ ok: true } | { ok: false; error: string }> {
-        if (!isNetEnabled()) {
-            return { ok: false, error: "这个版本没有包含组网密钥，无法接入" };
-        }
-        const code = parsePairingCode(pairingText);
-        if (!code) {
+        const parsed = parseAnyPairingCode(pairingText);
+        if (!parsed) {
             return {
                 ok: false,
                 error: "这个连接码解不开。整串重新复制一次（别漏字符），或者让主机扫一下二维码。",
             };
         }
+        const { code, kind } = parsed;
+        if (kind === "sealed" && !isNetEnabled()) {
+            return { ok: false, error: "这个版本没有包含组网密钥，无法接入" };
+        }
 
         this.state = enableNetworking(this.state, "leaf");
         this.persist();
 
-        if (!this.leaf) {
-            this.leaf = new LeafClient(this.identity.deviceId, this.identity.name, {
-                onLog: (m) => this.log(m),
-                onStatus: () => this.events.onSnapshot?.(this.snapshot()),
-                onMembers: () => this.events.onSnapshot?.(this.snapshot()),
-                onRelayResult: (f) => this.dispatchRelayResult(f),
-                onRelayBusy: (f) => this.dispatchRelayBusy(f),
-                onConfigPush: (f) => this.events.onConfigPush?.(f),
-                onFallback: (reason) => {
-                    // 关键：只改 role，不动地址与凭据 —— 退出不清除。
-                    // 下次用户打开开关，凭持久化的信息自动归位，无需重新配对。
-                    this.state = disableNetworking(this.state);
-                    this.persist();
-                    this.events.onFallbackNotice?.(
-                        `已退出组网（${reason}），现在可以独立工作。主机那边重新打开组网后，这里打开开关就能自动接回去，不用重新配对。`,
-                    );
-                },
-            });
-        }
+        if (!this.leaf) this.leaf = this.createLeaf();
 
-        const result = await this.leaf.pair(code);
+        // 邀请码 = 无条件向主机要密钥（见 leafClient.pair 里关于覆盖既有密钥的说明）
+        const result = await this.leaf.pair(code, { enroll: kind === "invite" });
         if (!result.ok) {
             this.state = disableNetworking(this.state);
             this.persist();
@@ -394,23 +509,9 @@ export class NetManager {
         }
         this.state = enableNetworking(this.state, "leaf");
         this.persist();
-        if (!this.leaf) {
-            this.leaf = new LeafClient(this.identity.deviceId, this.identity.name, {
-                onLog: (m) => this.log(m),
-                onStatus: () => this.events.onSnapshot?.(this.snapshot()),
-                onMembers: () => this.events.onSnapshot?.(this.snapshot()),
-                onRelayResult: (f) => this.dispatchRelayResult(f),
-                onRelayBusy: (f) => this.dispatchRelayBusy(f),
-                onConfigPush: (f) => this.events.onConfigPush?.(f),
-                onFallback: (reason) => {
-                    this.state = disableNetworking(this.state);
-                    this.persist();
-                    this.events.onFallbackNotice?.(
-                        `已退出组网（${reason}），现在可以独立工作。打开开关就能重新接入，不用重新配对。`,
-                    );
-                },
-            });
-        }
+        // 与首次配对共用同一份事件接线（onSecretLearned / onFallback 一条都不能漏）
+        if (!this.leaf) this.leaf = this.createLeaf();
+        // 「有凭据却没密钥」这种残缺状态由 LeafClient.connect 兜住并给出可操作的提示
         const { hostAddress, hostPort, credential } = this.state;
         // 上面的判空已经保证了三个字段都有值，这里取局部变量让 TS 也认得
         this.leaf.connect(hostAddress!, hostPort!, credential!);
@@ -420,7 +521,7 @@ export class NetManager {
     /**
      * 关闭组网。
      * **只把角色改回独立，不清任何配置**（地址、凭据、配对码、成员全留着），
-     * 下次打开开关自动归位。这是 ARCHITECTURE-PLAN 5.6 的硬要求。
+     * 下次打开开关自动归位。这是 ARCHITECTURE-PLAN 5.7 的硬要求。
      */
     stopNetworking(): void {
         this.leaf?.disconnect();
@@ -472,17 +573,38 @@ export class NetManager {
 
     // ── 叶子侧管理 ──────────────────────────────────────────────
 
-    /** 断开与主机的绑定并清掉本地凭据（对应 UI 的「移除自己」）。 */
+    /**
+     * 断开与主机的绑定并清掉本地凭据（对应 UI 的「移除自己」）。
+     *
+     * 同时丢掉「从这个网学到的密钥」，并按优先级退回下一把
+     * （本机自己签的那把 / 没有）。
+     * ⚠️ 必须连**文件里的** enrolledSecret 一起清（forgetEnrolledSecret）：
+     *    只改内存里的那把是不够的 —— 下次重启时构造函数会从文件里把它读回来，
+     *    用户以为自己退出了，实际又被悄悄绑回那个网。
+     */
     leaveHost(): void {
         this.leaf?.disconnect();
-        this.state = detachFromHost(this.state);
+        this.state = forgetEnrolledSecret(detachFromHost(this.state));
         this.persist();
+        // 退出这个网 = 连从它那里学到的密钥一起忘掉，退回「本机自己签的那把 / 没有」
+        setNetSecret(this.state.ownSecret || "");
+        this.log(this.state.ownSecret ? "[net] 已退出那个网，密钥还原成本机自己的" : "[net] 已退出那个网，本机现在没有组网密钥");
     }
 
-    /** 序列化当前配对码（供 UI 复制 / 生成二维码）。 */
+    /**
+     * 序列化配对码为**邀请码**（默认，供 UI 复制 / 生成二维码）。
+     *
+     * 为什么默认用邀请码：它不需要对方事先有密钥 —— 从源码跑、用 docker 跑的
+     * 核心版才能接进来。这正是不匹配问题的解药。
+     */
     serializePairing(code: PairingCode): string {
         // 原先是 require() 延迟引入（注释写「避免循环依赖」），但 pairingCode
         // 并不依赖 manager，没有环；require 在 ESM 下不可用，直接静态调用。
+        return serializeInviteCode(code);
+    }
+
+    /** 生成旧格式密文码：只给「本来就带着同一把密钥」的老客户端用。 */
+    serializeSealedPairing(code: PairingCode): string {
         return serializePairingCode(code);
     }
 
@@ -498,10 +620,13 @@ export class NetManager {
 
     /**
      * 叶子端上行请求（阶段 3）。回包走 events.onRelayResult 广播 —— 适合有界面的调用方。
+     * @param kbContext 本机私人知识库的检索结果。主机没有它，不带就等于白配了。
      * @returns false 表示当前没连上，调用方应回退到本地独立处理
      */
-    relay(content: string, sessionId: string, images?: string[]): boolean {
-        return (this.leaf?.sendRelay(content, sessionId, images, this.identity.name) ?? null) !== null;
+    relay(content: string, sessionId: string, images?: string[], kbContext?: KbPassage[]): boolean {
+        return (
+            (this.leaf?.sendRelay(content, sessionId, images, this.identity.name, kbContext) ?? null) !== null
+        );
     }
 
     /**
@@ -510,23 +635,32 @@ export class NetManager {
      * 给服务端形态的叶子用（kirari-core 接消息后必须给出回复）。
      * 按 requestId 精确配对，所以同一会话并发两条也不会串。
      *
-     * @param timeoutMs 等多久算超时。默认 60s —— 模型慢起来可能十几秒，
+     * @param opts.timeoutMs 等多久算超时。默认 60s —— 模型慢起来可能十几秒，
      *        但无限等会让调用方的 HTTP 请求悬挂，所以必须有上限。
      */
     relayAndWait(
         content: string,
         sessionId: string,
-        images?: string[],
-        timeoutMs = 60000,
+        opts: {
+            images?: string[];
+            timeoutMs?: number;
+            kbContext?: KbPassage[];
+            /** 提供了才向主机请求流式；增量在这里逐段回调（null = 作废重流） */
+            onDelta?: (chunk: string | null) => void;
+        } = {},
     ): Promise<{ ok: true; frame: RelayResult } | { ok: false; reason: string }> {
-        const requestId = this.leaf?.sendRelay(content, sessionId, images, this.identity.name) ?? null;
+        const requestId =
+            this.leaf?.sendRelay(content, sessionId, opts.images, this.identity.name, opts.kbContext, !!opts.onDelta) ?? null;
         if (!requestId) {
             // 没连上主机：这是可预期的状态（组网刚开、主机重启中），交给调用方决定回退策略
             return Promise.resolve({ ok: false, reason: "not-connected" });
         }
+        const timeoutMs = opts.timeoutMs ?? 60000;
+        if (opts.onDelta) this.pendingDeltas.set(requestId, opts.onDelta);
         return new Promise((resolve) => {
             const timer = setTimeout(() => {
                 this.pendingRelays.delete(requestId);
+                this.pendingDeltas.delete(requestId);
                 resolve({ ok: false, reason: `等主机回复超时（${Math.round(timeoutMs / 1000)} 秒）` });
             }, timeoutMs);
             this.pendingRelays.set(requestId, {
@@ -534,10 +668,30 @@ export class NetManager {
                 settle: (out) => {
                     clearTimeout(timer);
                     this.pendingRelays.delete(requestId);
+                    this.pendingDeltas.delete(requestId);
                     resolve(out);
                 },
             });
         });
+    }
+
+    /** 流式增量分发：只投给注册了 onDelta 的等待者；没人等就丢弃（fire-and-forget 场景）。 */
+    private dispatchRelayDelta(frame: RelayDelta): void {
+        const sink = this.pendingDeltas.get(frame.requestId);
+        if (!sink) return;
+        if (frame.reset) {
+            try {
+                sink(null);
+            } catch {
+                /* 调用方的展示逻辑炸了不能影响组网 */
+            }
+        } else if (typeof frame.text === "string" && frame.text.length) {
+            try {
+                sink(frame.text);
+            } catch {
+                /* ignore */
+            }
+        }
     }
 
     /** 回包分发：先兑现等着的那条请求，再照常广播给 events。 */
@@ -636,6 +790,7 @@ export class NetManager {
             waiter.settle({ ok: false, reason: "组网已退出，这条请求没能发出去" });
         }
         this.pendingRelays.clear();
+        this.pendingDeltas.clear();
     }
 }
 

@@ -89,7 +89,7 @@ describe("上行链路（真实两端）", () => {
         expect(joined.ok).toBe(true);
         expect(await waitFor(() => hostHasOnlineLeaf(host))).toBe(true);
 
-        const out = await leaf.relayAndWait("在吗", "s1", undefined, 8000);
+        const out = await leaf.relayAndWait("在吗", "s1", { timeoutMs: 8000 });
         expect(out.ok).toBe(true);
         if (out.ok) {
             expect(out.frame.speech).toContain("在吗");
@@ -111,7 +111,7 @@ describe("上行链路（真实两端）", () => {
 
         // 先确认第一次接入是通的 —— 否则这个用例证明不了「重连坏了」，
         // 只证明了「本来就没通」。
-        const before = await first.relayAndWait("第一轮", "s1", undefined, 8000);
+        const before = await first.relayAndWait("第一轮", "s1", { timeoutMs: 8000 });
         expect(before.ok).toBe(true);
 
         // ── 模拟进程重启 ──
@@ -127,8 +127,94 @@ describe("上行链路（真实两端）", () => {
         //    这正是当初这个 bug 能一路瞒过日志的原因。
         expect(await waitFor(() => hostHasOnlineLeaf(host))).toBe(true);
 
-        const after = await second.relayAndWait("重启后还在吗", "s1", undefined, 8000);
+        const after = await second.relayAndWait("重启后还在吗", "s1", { timeoutMs: 8000 });
         expect(after.ok).toBe(true);
         if (after.ok) expect(after.frame.speech).toContain("重启后还在吗");
     }, 30000);
+
+    it("叶子带的私人知识库片段会原样到达主机执行器（超长的会被截断）", async () => {
+        // 私人知识库存在叶子本地，主机没有别的途径拿到 —— 靠请求帧带上来。
+        // 这条链路若断，症状很隐蔽：本地聊得好好的，一进组网回答就变差，还没有任何报错。
+        const seen: { content: string; kbContext: unknown }[] = [];
+        const host = track(new NetManager(tmpDir("host")));
+        host.attachHostExecutor(async ({ content, kbContext }) => {
+            seen.push({ content, kbContext });
+            return { speech: "收到", emotion: null };
+        });
+        expect((await host.startHosting()).ok).toBe(true);
+
+        const leaf = track(new NetManager(tmpDir("leaf")));
+        const joined = await leaf.startFollowing(host.serializePairing(host.issuePairing()));
+        expect(joined.ok).toBe(true);
+        expect(await waitFor(() => hostHasOnlineLeaf(host))).toBe(true);
+
+        const kb = [
+            { text: "主人的猫叫小八", source: "私人笔记", url: "memo://cat", score: 0.9 },
+            // 超长片段：应被截断而不是原样进主机提示词（那是别的设备发来的内容）
+            { text: "x".repeat(5000) },
+            // 空正文：应被丢弃
+            { text: "   " },
+            // 不该出现的形状：应被忽略
+            null,
+        ];
+        const out = await leaf.relayAndWait("我家猫叫什么", "s-kb", { timeoutMs: 8000, kbContext: kb as never });
+        expect(out.ok).toBe(true);
+
+        expect(await waitFor(() => seen.length > 0)).toBe(true);
+        const got = seen[0].kbContext as { text: string; source?: string; url?: string }[];
+        expect(Array.isArray(got)).toBe(true);
+        expect(got).toHaveLength(2); // 空正文与 null 被丢掉
+        expect(got[0]).toMatchObject({ text: "主人的猫叫小八", source: "私人笔记", url: "memo://cat" });
+        expect(got[1].text).toHaveLength(2000); // 超长的被截断
+    }, 25000);
+
+    it("请求流式时：主机的增量按序单播到请求方（含工具轮的 reset），最终 result 仍完整到达", async () => {
+        // 模拟真实模型行为：第一轮流几个碎片后转去调工具（onDelta(null) 作废），
+        // 第二轮流最终正文。叶子应收到 碎片 → reset → 最终碎片 的顺序。
+        const host = track(new NetManager(tmpDir("host")));
+        host.attachHostExecutor(async ({ onDelta }) => {
+            onDelta?.("我先想想");
+            onDelta?.("，查一下");
+            onDelta?.(null); // 工具轮作废，请求方应清空
+            onDelta?.("最终答案");
+            return { speech: "最终答案", emotion: "happy" };
+        });
+        expect((await host.startHosting()).ok).toBe(true);
+
+        const leaf = track(new NetManager(tmpDir("leaf")));
+        const joined = await leaf.startFollowing(host.serializePairing(host.issuePairing()));
+        expect(joined.ok).toBe(true);
+        expect(await waitFor(() => hostHasOnlineLeaf(host))).toBe(true);
+
+        const received: (string | null)[] = [];
+        const out = await leaf.relayAndWait("流式测试", "s-stream", {
+            timeoutMs: 8000,
+            onDelta: (chunk) => received.push(chunk),
+        });
+        expect(out.ok).toBe(true);
+        if (out.ok) expect(out.frame.speech).toBe("最终答案");
+
+        // 顺序必须严格：碎片在 reset 前、reset 在最终碎片前（ws 单帧有序 + TCP 保序）
+        expect(received).toEqual(["我先想想", "，查一下", null, "最终答案"]);
+    }, 25000);
+
+    it("不带 stream 标志时主机不发任何 delta（向后兼容）", async () => {
+        const host = track(new NetManager(tmpDir("host")));
+        host.attachHostExecutor(async ({ onDelta }) => {
+            // 请求没带 stream → 执行器不该拿到 onDelta
+            expect(onDelta).toBeUndefined();
+            return { speech: "整包回复", emotion: null };
+        });
+        expect((await host.startHosting()).ok).toBe(true);
+
+        const leaf = track(new NetManager(tmpDir("leaf")));
+        const joined = await leaf.startFollowing(host.serializePairing(host.issuePairing()));
+        expect(joined.ok).toBe(true);
+        expect(await waitFor(() => hostHasOnlineLeaf(host))).toBe(true);
+
+        // 不传 onDelta → 不带 stream 标志 → 行为与旧协议完全一致
+        const out = await leaf.relayAndWait("不流式", "s-plain", { timeoutMs: 8000 });
+        expect(out.ok).toBe(true);
+        if (out.ok) expect(out.frame.speech).toBe("整包回复");
+    }, 25000);
 });

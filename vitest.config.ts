@@ -5,8 +5,11 @@ import { defineConfig } from "vitest/config";
 // 组网层是桌面端与核心版**共用**的实现，测试跟着代码走 —— 留在一侧的话，
 // 另一侧的用法就完全没有验证。
 //
-// 不需要在这里注入密钥：密钥已改成显式注入（见 src/secure.ts），
-// 测试文件里自己调 setNetSecret() 就行，不再依赖「env 必须早于模块加载」那种时序技巧。
+// 不需要在这里注入密钥：密钥由 NetManager 在运行时自己解决（自签 / 配对期领取），
+// 不依赖「env 必须早于模块加载」那种时序技巧。
+// 需要一把密钥的用例（配置同步、上行链路那两份）自己调 setNetSecret() 一把，
+// 好把「密钥分发」这条链路从被测对象里隔离出去；密钥分发本身由
+// enroll.integration.spec.ts 专门守。
 export default defineConfig({
     test: {
         // 全部是主进程/服务端代码（node:fs、crypto、ws），没有 DOM。

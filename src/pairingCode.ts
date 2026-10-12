@@ -1,10 +1,15 @@
 // kirari-net · src/pairingCode.ts
 // 连接码：生成、解析、校验、哈希。
 //
-// 「连接码」是设备之间配对用的通行证，形如：
-//   kirari://connect?host=192.168.57.23&port=19760&token=xxxx&name=Aki-台式机&exp=1789xxxxxx&v=1
+// 「连接码」是设备之间配对用的通行证，**两种形态**（详见 ARCHITECTURE-PLAN §5.2）：
+//   · 邀请码（默认）    kirari://join?d=<base64(JSON)>
+//       不需要密钥就能解析 —— 新设备本来就没有密钥，若码必须用密钥才能解，
+//       就成了「要有密钥才能拿到密钥」的死循环。安全性靠里面的一次性口令。
+//   · 密文码（旧，兼容） kirari://connect?d=<密文>
+//       整包加密，给「本来就带着密钥的旧客户端」用。
+//   两者统一走 parseAnyPairingCode() 解析。
 //
-// 三个关键设计（来自 ARCHITECTURE-PLAN 5.3~5.5）：
+// 三个关键设计（来自 ARCHITECTURE-PLAN §5.4~5.6）：
 //  1. **只管首次配对**。用掉一次就作废，之后设备靠长期凭据自动重连。
 //     所以它过期影响的是「新设备还能不能配对」，不是「已连上的设备断不断」。
 //  2. **只存哈希，不存明文**。载体是文本/二维码，极易被截图转发。
@@ -29,7 +34,7 @@ import { getNetSecret, deriveKey, seal, open } from "./secure";
  */
 const PAIRING_SALT = "kirari-pairing-v1";
 
-/** 连接码的加密密钥。没带组网密钥的构建无法生成/解析连接码。 */
+/** 密文码的加密密钥 —— 由本机组网密钥派生。手上还没有密钥时生成/解析不了密文码。 */
 function pairingKey(): Buffer | null {
     if (!getNetSecret()) return null;
     return deriveKey(getNetSecret(), PAIRING_SALT);
@@ -174,8 +179,9 @@ export function generatePairingCode(opts: {
  */
 export function serializePairingCode(code: PairingCode): string {
     const key = pairingKey();
-    // 没有密钥就不给生成明文码 —— 与其悄悄降级成不安全，不如明确失败
-    if (!key) throw new Error("当前构建没有组网密钥，无法生成连接码");
+    // 没有密钥就不给生成密文码 —— 与其悄悄降级成不安全，不如明确失败。
+    // （这条路径不该出现在正常流程里：新设备一律发邀请码，那个不需要密钥。）
+    if (!key) throw new Error("本机还没有组网密钥，生成不了密文码");
     const payload = {
         h: code.host,
         p: code.port,
@@ -233,6 +239,90 @@ export function parsePairingCode(raw: string): PairingCode | null {
         expiresAt: Number.isFinite(expNum) && expNum >= 0 ? expNum : 0,
         v: Number.isFinite(vNum) && vNum > 0 ? vNum : PROTOCOL_VERSION,
     };
+}
+
+/**
+ * ── 邀请码（新格式，密钥的无感分发全靠它）──────────────────────
+ *
+ * 形如：kirari://join?d=<base64(JSON)>
+ *
+ * 与上面那种密文码的区别：**不需要先有密钥就能解开**。这一点是刻意的，
+ * 也是整条链路能跑通的前提 —— 新设备本来就没有密钥，若码必须用密钥才能解，
+ * 就成了「要有密钥才能拿到密钥」的死循环。
+ *
+ * 那么密钥的安全性靠什么？靠**一次性口令 t**：
+ *   - 口令是一次性的：用过一次即作废（usedBy），可单独撤销（revoked），有过期时间
+ *   - 光拿到码、在局域网里对着主机扫端口是没用的 —— 第二轮握手（enroll）
+ *     会校验这个口令，不对的话主机一个字节的密钥都不会吐出来
+ *   - 类比 WiFi 分享二维码：里面确实是明文的，但「看得见」不等于「能连上」
+ *
+ * ⚠️ 与密文码的安全差别要说清楚：密文码被截图转发后，没有那把组网密钥的人
+ *    连里面的口令都看不到；邀请码被转发后，转发者可以拿着口令去 enroll，
+ *    **从而拿到组网密钥**。所以邀请码必须按「等同密码」对待 ——
+ *    一次性、短期有效、可撤销，判罚标准与密文码一致。
+ */
+export const JOIN_SCHEME = "kirari://join";
+
+export function serializeInviteCode(code: PairingCode): string {
+    const payload = {
+        h: code.host,
+        p: code.port,
+        t: code.token,
+        n: code.name,
+        e: code.expiresAt,
+        v: code.v,
+    };
+    return `${JOIN_SCHEME}?d=${encodeURIComponent(Buffer.from(JSON.stringify(payload), "utf8").toString("base64"))}`;
+}
+
+/** 解析邀请码。解不开返回 null。 */
+export function parseInviteCode(raw: string): PairingCode | null {
+    const text = String(raw || "").trim();
+    if (!text.toLowerCase().startsWith(JOIN_SCHEME)) return null;
+    let q: URLSearchParams;
+    try {
+        q = new URL(text).searchParams;
+    } catch {
+        return null;
+    }
+    const d = q.get("d");
+    if (!d) return null;
+    let payload: Record<string, unknown>;
+    try {
+        payload = JSON.parse(Buffer.from(d, "base64").toString("utf8"));
+    } catch {
+        return null;
+    }
+    if (!payload || typeof payload !== "object") return null;
+    const host = typeof payload.h === "string" ? payload.h.trim() : "";
+    const token = typeof payload.t === "string" ? payload.t.trim() : "";
+    if (!host || !token) return null;
+    const portNum = Number(payload.p);
+    const expNum = Number(payload.e);
+    const vNum = Number(payload.v ?? PROTOCOL_VERSION);
+    return {
+        host,
+        port: Number.isFinite(portNum) && portNum > 0 && portNum < 65536 ? portNum : NET_PORT,
+        token,
+        name: typeof payload.n === "string" && payload.n.trim() ? payload.n.trim().slice(0, 40) : "未命名设备",
+        expiresAt: Number.isFinite(expNum) && expNum >= 0 ? expNum : 0,
+        v: Number.isFinite(vNum) && vNum > 0 ? vNum : PROTOCOL_VERSION,
+    };
+}
+
+/**
+ * 两种码都认。
+ *
+ * 密文码给「本来就带着密钥的旧客户端」用（那台设备多半是我自己发出去的桌宠包），
+ * 邀请码给「手上一把密钥也没有的新部署」用。判不出来返回 null。
+ */
+export function parseAnyPairingCode(raw: string): { code: PairingCode; kind: "invite" | "sealed" } | null {
+    const text = String(raw || "").trim();
+    const invite = parseInviteCode(text);
+    if (invite) return { code: invite, kind: "invite" };
+    const sealed = parsePairingCode(text);
+    if (sealed) return { code: sealed, kind: "sealed" };
+    return null;
 }
 
 /** 配对码是否还在有效期内（永不过期返回 true）。 */
