@@ -79,6 +79,43 @@ function hostHasOnlineLeaf(host: NetManager): boolean {
 }
 
 describe("上行链路（真实两端）", () => {
+    it("一条提问的输入与回复都广播给全网（含主机和另一台叶子）", async () => {
+        const hostPrompts: string[] = [];
+        const leaf1Prompts: string[] = [];
+        const leaf2Prompts: string[] = [];
+        const hostResults: string[] = [];
+        const leaf2Results: string[] = [];
+
+        const host = track(
+            new NetManager(tmpDir("host"), {
+                onRelayPrompt: (f) => hostPrompts.push(f.content),
+                onRelayResult: (f) => hostResults.push(f.speech),
+            }),
+        );
+        host.attachHostExecutor(echoExecutor);
+        expect((await host.startHosting()).ok).toBe(true);
+
+        const leaf1 = track(new NetManager(tmpDir("leaf-1"), { onRelayPrompt: (f) => leaf1Prompts.push(f.content) }));
+        expect((await leaf1.startFollowing(host.serializePairing(host.issuePairing()))).ok).toBe(true);
+
+        const leaf2 = track(
+            new NetManager(tmpDir("leaf-2"), {
+                onRelayPrompt: (f) => leaf2Prompts.push(f.content),
+                onRelayResult: (f) => leaf2Results.push(f.speech),
+            }),
+        );
+        expect((await leaf2.startFollowing(host.serializePairing(host.issuePairing()))).ok).toBe(true);
+        expect(await waitFor(() => host.snapshot().members.filter((m) => m.online).length === 2)).toBe(true);
+
+        const out = await leaf1.relayAndWait("大家都能看到我", "sync-view", { timeoutMs: 8000 });
+        expect(out.ok).toBe(true);
+        expect(await waitFor(() => hostPrompts.includes("大家都能看到我") && leaf2Prompts.includes("大家都能看到我"))).toBe(true);
+        // 发起方也一定收到 prompt（全节点一致视图，宿主层按 requestId 合并本地那条）
+        expect(leaf1Prompts).toContain("大家都能看到我");
+        expect(await waitFor(() => hostResults.length > 0 && leaf2Results.length > 0)).toBe(true);
+        expect(hostResults[0]).toBe(leaf2Results[0]);
+    }, 25000);
+
     it("叶子提问 → 主机执行器 → 回复按 requestId 回到提问方", async () => {
         const host = track(new NetManager(tmpDir("host")));
         host.attachHostExecutor(echoExecutor);

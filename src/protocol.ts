@@ -273,6 +273,28 @@ export type KbPassage = {
     score?: number;
 };
 
+/**
+ * 主机 → 全网：某台设备刚提交的用户输入。
+ *
+ * 活锁模型仍然是「只有主机调用模型一次」，但为了让所有节点看到一致的对话流，
+ * 主机在**受理**请求时先把问题本身广播出去。请求方本地已显示的问题用同一个
+ * requestId 合并，避免重复显示。被拒绝的请求（队列满 / 关停）不会发这帧。
+ */
+export type RelayPrompt = {
+    type: "relay_prompt";
+    v: number;
+    requestId: string;
+    /** 提问设备 */
+    fromDeviceId: string;
+    fromName?: string;
+    /** 提问方会话 ID；各端决定要不要记进自己的历史 */
+    sessionId: string;
+    content: string;
+    images?: string[];
+    /** 主机受理时刻（毫秒），各端按 requestId + 时间排序 */
+    askedAt: number;
+};
+
 /** 主机 → 全网：生成好的回复。 */
 export type RelayResult = {
     type: "relay_result";
@@ -373,6 +395,7 @@ export type ServerFrame =
     | HostShutdown
     | EnrollGrant
     | EnrollFail
+    | RelayPrompt
     | RelayResult
     | RelayDelta
     | RelayBusy

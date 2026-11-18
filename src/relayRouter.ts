@@ -17,7 +17,7 @@
 // 所以组网层可以独立测试，core 也能塞进不同的执行器。
 
 import { PROTOCOL_VERSION } from "./protocol";
-import type { RelayRequest, RelayResult, RelayBackfill, KbPassage } from "./protocol";
+import type { RelayRequest, RelayResult, RelayPrompt, RelayBackfill, KbPassage } from "./protocol";
 
 /**
  * 执行器：拿到一条上行请求，返回一段回复。
@@ -45,6 +45,8 @@ export type RelayExecutor = (req: {
 }) => Promise<{ speech: string; emotion?: string | null }>;
 
 export type RelayRouterEvents = {
+    /** 把用户输入广播给全网（含主机自己），让所有节点看到一致的提问 */
+    broadcastPrompt: (frame: RelayPrompt) => void;
     /** 把结果广播给全网（含主机自己） */
     broadcast: (frame: RelayResult) => void;
     /** 只回给某一个叶子（限流拒绝等） */
@@ -174,6 +176,17 @@ export class RelayRouter {
         }
 
         this.queue.push({ req, enqueuedAt: Date.now() });
+        this.events.broadcastPrompt({
+            type: "relay_prompt",
+            v: PROTOCOL_VERSION,
+            requestId: req.requestId,
+            fromDeviceId: req.deviceId,
+            fromName: req.nickname,
+            sessionId: req.sessionId,
+            content: req.content,
+            images: Array.isArray(req.images) ? req.images : undefined,
+            askedAt: Date.now(),
+        });
         this.events.onLog?.(
             `[relay] 已受理（运行中 ${this.running}，排队 ${this.queue.length}）来自 ${req.deviceId}`,
         );

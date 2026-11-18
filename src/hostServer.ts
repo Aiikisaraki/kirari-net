@@ -12,7 +12,7 @@
 import { WebSocketServer, type WebSocket } from "ws";
 import * as os from "node:os";
 import { NET_PORT, PROTOCOL_VERSION, parseClientFrame } from "./protocol";
-import type { Hello, HelloAck } from "./protocol";
+import type { Hello, HelloAck, RelayPrompt } from "./protocol";
 import { isNetEnabled, getNetSecret, deriveKey, newSalt, seal, open, ReplayGuard } from "./secure";
 import type { MembersMessage, PairResponse, PongMessage, HostShutdown, RelayRequest, RelayBackfill, RelayBusy, ConfigReport, ClientFrame, EnrollRequest } from "./protocol";
 import { filterWhitelisted } from "./netStore";
@@ -39,6 +39,8 @@ export type HostEvents = {
      * 返回 true 表示已受理。由 NetManager 注入 RelayRouter。
      */
     onRelayRequest?: (req: RelayRequest) => boolean;
+    /** 广播一条已受理的用户输入，让全网看到一致的对话流 */
+    broadcastRelayPrompt?: (frame: RelayPrompt) => void;
     /** 处理离线补传（只记对话，不调模型） */
     onRelayBackfill?: (msg: RelayBackfill) => void;
     /**

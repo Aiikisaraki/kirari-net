@@ -20,7 +20,7 @@ import {
     PROTOCOL_VERSION,
     SeqTracker,
 } from "./protocol";
-import type { MembersMessage, RelayResult, RelayBusy, RelayBackfill, ConfigPush, SyncField, HelloAck, KbPassage, RelayDelta, EnrollGrant } from "./protocol";
+import type { MembersMessage, RelayPrompt, RelayResult, RelayBusy, RelayBackfill, ConfigPush, SyncField, HelloAck, KbPassage, RelayDelta, EnrollGrant } from "./protocol";
 import { isNetEnabled, getNetSecret, deriveKey, seal, open, ReplayGuard, setNetSecret } from "./secure";
 import { newEnrollKeypair, openSecretOwnPair } from "./enroll";
 import type { EnrollKeypair } from "./enroll";
@@ -35,6 +35,8 @@ export type LeafEvents = {
     onFallback?: (reason: string) => void;
     /** 成员列表更新 */
     onMembers?: (members: MembersMessage["members"]) => void;
+    /** 主机广播的「某台设备刚提交的用户输入」。请求方按 requestId 合并，避免重复显示。 */
+    onRelayPrompt?: (frame: RelayPrompt) => void;
     /**
      * 收到广播的回复（阶段 3）。
      * 注意是**全网广播**——别人的提问也会推过来，这是活锁模型的必然结果：
@@ -551,6 +553,10 @@ export class LeafClient {
                 // 硬断线必须立即响应 —— 用户感知不到等待才有体感。
                 this.events.onLog?.(`[net] ${frame.reason}`);
                 this.fallback(frame.reason);
+                return;
+            }
+            if (frame.type === "relay_prompt") {
+                this.events.onRelayPrompt?.(frame as RelayPrompt);
                 return;
             }
             if (frame.type === "relay_result") {

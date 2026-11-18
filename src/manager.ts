@@ -42,7 +42,7 @@ import {
 } from "./pairingCode";
 import type { PairingCode, ExpiryKey } from "./pairingCode";
 import { NET_PORT, PROTOCOL_VERSION, SYNC_FIELDS } from "./protocol";
-import type { RelayResult, RelayBusy, RelayDelta, RelayBackfill, ConfigPush, SyncField, KbPassage } from "./protocol";
+import type { RelayPrompt, RelayResult, RelayBusy, RelayDelta, RelayBackfill, ConfigPush, SyncField, KbPassage } from "./protocol";
 import { RelayRouter } from "./relayRouter";
 import type { RelayExecutor } from "./relayRouter";
 import { isNetEnabled, setNetSecret, newNetSecret } from "./secure";
@@ -74,6 +74,11 @@ export type NetManagerEvents = {
     /** 自动退出组网时要告知用户（避免误以为程序崩了） */
     onFallbackNotice?: (message: string) => void;
     onLog?: (message: string) => void;
+    /**
+     * 收到全网广播的用户输入。所有设备都会收到 —— 全节点一致视图的基础。
+     * 请求方本地已经在发送时显示过同样内容，宿主必须按 requestId 去重。
+     */
+    onRelayPrompt?: (frame: RelayPrompt) => void;
     /**
      * 收到全网广播的回复（阶段 3）。所有设备都会收到 —— 活锁模型的必然结果。
      * 请求方自己的发言已在本地显示，这里只管把回复显示出来。
@@ -233,6 +238,11 @@ export class NetManager {
                 maxConcurrent: Number(process.env.NET_MAX_CONCURRENT || 2),
                 maxQueue: Number(process.env.NET_MAX_QUEUE || 20),
                 events: {
+                    // 用户输入广播：发给所有叶子 + 主机自己（各方按 requestId 合并本地已显示的那条）
+                    broadcastPrompt: (frame) => {
+                        this.host?.broadcast(frame);
+                        this.events.onRelayPrompt?.(frame);
+                    },
                     // 广播：发给所有叶子 + 自己也收到（主机也是全网一员）
                     broadcast: (frame) => {
                         this.host?.broadcast(frame);
@@ -430,6 +440,7 @@ export class NetManager {
             onLog: (m) => this.log(m),
             onStatus: () => this.events.onSnapshot?.(this.snapshot()),
             onMembers: () => this.events.onSnapshot?.(this.snapshot()),
+            onRelayPrompt: (f) => this.events.onRelayPrompt?.(f),
             onRelayResult: (f) => this.dispatchRelayResult(f),
             onRelayBusy: (f) => this.dispatchRelayBusy(f),
             onRelayDelta: (f) => this.dispatchRelayDelta(f),
@@ -621,12 +632,39 @@ export class NetManager {
     /**
      * 叶子端上行请求（阶段 3）。回包走 events.onRelayResult 广播 —— 适合有界面的调用方。
      * @param kbContext 本机私人知识库的检索结果。主机没有它，不带就等于白配了。
-     * @returns false 表示当前没连上，调用方应回退到本地独立处理
+     * @returns null 表示当前没连上，调用方应回退到本地独立处理
      */
-    relay(content: string, sessionId: string, images?: string[], kbContext?: KbPassage[]): boolean {
-        return (
-            (this.leaf?.sendRelay(content, sessionId, images, this.identity.name, kbContext) ?? null) !== null
-        );
+    relay(content: string, sessionId: string, images?: string[], kbContext?: KbPassage[]): string | null {
+        return this.leaf?.sendRelay(content, sessionId, images, this.identity.name, kbContext) ?? null;
+    }
+
+    /**
+     * 主机本机提交一条用户输入，和叶子上行走同一条路由。
+     *
+     * 这样主机自己的提问也会产生 relay_prompt + relay_result 广播，
+     * 全网（含主机自己）看到一致的对话流。没在当主机 / 路由没准备好时返回 null，
+     * 调用方应回退到本地独立调用。
+     */
+    submitLocalPrompt(content: string, sessionId: string, images?: string[], kbContext?: KbPassage[]): string | null {
+        if (this.state.role !== "host" || !this.router || !this.host?.isRunning) return null;
+        const requestId = `${this.identity.deviceId}:local:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`;
+        const accepted = this.router.handle({
+            type: "relay_request",
+            v: PROTOCOL_VERSION,
+            deviceId: this.identity.deviceId,
+            requestId,
+            sessionId,
+            content,
+            images,
+            nickname: this.identity.name,
+            kbContext,
+        });
+        return accepted ? requestId : null;
+    }
+
+    /** 当前角色：给宿主决定走 leaf relay 还是 host local submit。 */
+    get role(): NetRole {
+        return this.state.role;
     }
 
     /**
