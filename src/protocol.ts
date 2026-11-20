@@ -388,6 +388,79 @@ export type ConfigPush = {
     patch: Partial<Record<SyncField, string>>;
 };
 
+// ── 远程工具执行（阶段 5）────────────────────────────────────────
+//
+// 为什么需要这一层：MCP 工具和 skill 都是**各节点本地**的能力 —— 主机上看不见
+// 叶子上装了哪些 MCP server / skill，叶子上也跑不了主机的。用户的要求是
+// 「点明某个叶子节点，就操作那个叶子节点的 mcp 和 skill」，所以必须能把一次
+// 工具调用转发到指定设备上执行，再把结果拿回来。
+//
+// 与 relay_request 的分工：relay_* 转发的是**一次完整的模型对话**（主机调模型、
+// 产出整段回复）；tool_call/tool_result 转发的是**模型在这次对话里发起的一次工具
+// 调用**（执行发生在叶子，决策仍发生在主机）。两者不重叠。
+
+/**
+ * 叶子 → 主机：我这边有哪些可远程调用的工具（开机/重连时上报一次）。
+ *
+ * 主机据此知道「哪些叶子能跑 MCP / skill」，从而在模型点名某设备时判断可行性，
+ * 而不是盲目转发然后等超时。skills 是行为模板 id，mcpServers 是 server 名。
+ */
+export type ToolCapsReport = {
+    type: "tool_caps_report";
+    v: number;
+    deviceId: string;
+    /** 本机可执行的 MCP server 名称 */
+    mcpServers: string[];
+    /** 本机可执行的 skill id */
+    skills: string[];
+    /**
+     * 本机工具清单（工具名 → 归属），供主机做「这个工具在哪台机器上」的路由。
+     * 只报名字不报内容：参数 schema 由主机侧缓存，避免每帧都变大。
+     */
+    toolNames?: { name: string; source: "mcp" | "skill"; owner: string }[];
+};
+
+/**
+ * 主机 → 叶子：请你在本地执行一次工具调用。
+ *
+ * 主机只做路由与判别：它不知道叶子上的 MCP 连接细节，只把「工具名 + 参数」发过去，
+ * 由叶子用自己已经建立好的 MCP/skill 连接执行。
+ */
+export type ToolCall = {
+    type: "tool_call";
+    v: number;
+    /** 关联 id：tool_result 原样带回，主机据此配对并发调用 */
+    callId: string;
+    /** 在哪个会话里发起的（叶子执行日志/审批用，不改变行为） */
+    sessionId?: string;
+    /** 工具名，如 mcp 的 "server__tool" 或 skill 的 "skill__<id>__<tool>" */
+    name: string;
+    /** 调用参数（模型给的 JSON） */
+    args?: unknown;
+    /** 等多久算超时（毫秒）。主机侧也有上界，这里是给叶子的礼貌提示 */
+    timeoutMs?: number;
+};
+
+/**
+ * 叶子 → 主机：工具执行结果。
+ *
+ * 失败也必须回这一帧（ok:false + error），否则主机会一直等到超时 ——
+ * 超时只能说明「没回音」，分不清「工具报错」还是「设备掉线」，排障体验差很多。
+ */
+export type ToolResult = {
+    type: "tool_result";
+    v: number;
+    callId: string;
+    deviceId: string;
+    ok: boolean;
+    /** 成功时的结果（字符串化后的工具输出，与本地执行同一格式） */
+    result?: string;
+    /** 失败原因（ok:false 时必有） */
+    error?: string;
+    /** 执行耗时（毫秒），便于排查「叶子慢」还是「网络慢」 */
+    elapsedMs?: number;
+};
+
 export type ServerFrame =
     | PairResponse
     | PongMessage
@@ -401,8 +474,18 @@ export type ServerFrame =
     | RelayBusy
     | RelayBackfillAck
     | ConfigPush
+    | ToolCall
     | HelloAck;
-export type ClientFrame = Hello | EnrollRequest | PairRequest | PingMessage | RelayRequest | RelayBackfill | ConfigReport;
+export type ClientFrame =
+    | Hello
+    | EnrollRequest
+    | PairRequest
+    | PingMessage
+    | RelayRequest
+    | RelayBackfill
+    | ConfigReport
+    | ToolCapsReport
+    | ToolResult;
 
 /** 解析服务端发来的文本帧。非法 JSON / 缺 type 一律返回 null（不抛）。 */
 export function parseServerFrame(raw: unknown): ServerFrame | null {

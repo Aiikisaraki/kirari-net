@@ -20,7 +20,7 @@ import {
     PROTOCOL_VERSION,
     SeqTracker,
 } from "./protocol";
-import type { MembersMessage, RelayPrompt, RelayResult, RelayBusy, RelayBackfill, ConfigPush, SyncField, HelloAck, KbPassage, RelayDelta, EnrollGrant } from "./protocol";
+import type { MembersMessage, RelayPrompt, RelayResult, RelayBusy, RelayBackfill, ConfigPush, SyncField, HelloAck, KbPassage, RelayDelta, EnrollGrant, ToolCall } from "./protocol";
 import { isNetEnabled, getNetSecret, deriveKey, seal, open, ReplayGuard, setNetSecret } from "./secure";
 import { newEnrollKeypair, openSecretOwnPair } from "./enroll";
 import type { EnrollKeypair } from "./enroll";
@@ -53,6 +53,14 @@ export type LeafEvents = {
     onRelayDelta?: (frame: RelayDelta) => void;
     /** 主机下发了配置（白名单内的字段），写进本机即生效 */
     onConfigPush?: (frame: ConfigPush) => void;
+    /**
+     * 主机点名要本机执行一次工具调用（阶段 5）。
+     *
+     * 宿主必须**尽最大努力回** tool_result（用 leafClient.sendToolResult）：
+     * 成功回结果、失败回原因。哪怕本机压根没装这个工具也要回 ok:false ——
+     * 不回就只能让主机等到超时，而超时无法区分「没这个工具」与「设备掉线」。
+     */
+    onToolCall?: (frame: ToolCall) => void;
     /**
      * 配对期从主机学到了组网密钥。
      *
@@ -590,6 +598,13 @@ export class LeafClient {
                 this.events.onLog?.(`[net] 补传已被主机接收（${frame.count} 条）`);
                 return;
             }
+            if (frame.type === "tool_call") {
+                // 主机点名要本机执行一次工具调用（阶段 5）。
+                // 叶子不认识/没装这个工具也必须回 tool_result(ok:false)，
+                // 否则主机要一直等到超时，而超时分不清「没这个工具」和「设备掉了」。
+                this.events.onToolCall?.(frame as ToolCall);
+                return;
+            }
         });
     }
 
@@ -774,6 +789,56 @@ export class LeafClient {
     /** 待补传的条数（给 UI 显示「有 N 条待同步」） */
     pendingBackfillCount(): number {
         return this.pendingBackfill.reduce((n, b) => n + b.entries.length, 0);
+    }
+
+    /**
+     * 上报本机可远程执行的工具清单（阶段 5）。
+     *
+     * 主机据此建「工具 → 设备」路由表，模型点名某台设备时才知道它到底有什么。
+     * 返回 false 表示当前没连上主机；连上后由上层在握手完成时再调一次即可。
+     */
+    reportToolCaps(caps: {
+        mcpServers: string[];
+        skills: string[];
+        toolNames?: { name: string; source: "mcp" | "skill"; owner: string }[];
+    }): boolean {
+        const ws = this.ws;
+        if (!ws || ws.readyState !== 1) return false;
+        return this.sendFrame(ws, {
+            type: "tool_caps_report",
+            v: PROTOCOL_VERSION,
+            deviceId: this.deviceId,
+            mcpServers: Array.isArray(caps.mcpServers) ? caps.mcpServers : [],
+            skills: Array.isArray(caps.skills) ? caps.skills : [],
+            toolNames: Array.isArray(caps.toolNames) ? caps.toolNames : undefined,
+        });
+    }
+
+    /**
+     * 把一次工具执行结果回给主机（阶段 5）。
+     *
+     * 失败也必须回，否则主机只能等到超时 —— 而超时分不清「工具报错」和
+     * 「设备掉线」，排障会很难受。
+     */
+    sendToolResult(res: {
+        callId: string;
+        ok: boolean;
+        result?: string;
+        error?: string;
+        elapsedMs?: number;
+    }): boolean {
+        const ws = this.ws;
+        if (!ws || ws.readyState !== 1) return false;
+        return this.sendFrame(ws, {
+            type: "tool_result",
+            v: PROTOCOL_VERSION,
+            callId: res.callId,
+            deviceId: this.deviceId,
+            ok: !!res.ok,
+            result: res.ok ? res.result : undefined,
+            error: res.ok ? undefined : res.error || "执行失败",
+            elapsedMs: typeof res.elapsedMs === "number" ? res.elapsedMs : undefined,
+        });
     }
 
     /** 重连成功后自动补传。主机确认（backfill_ack）后清空。 */

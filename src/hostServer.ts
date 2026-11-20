@@ -14,7 +14,7 @@ import * as os from "node:os";
 import { NET_PORT, PROTOCOL_VERSION, parseClientFrame } from "./protocol";
 import type { Hello, HelloAck, RelayPrompt } from "./protocol";
 import { isNetEnabled, getNetSecret, deriveKey, newSalt, seal, open, ReplayGuard } from "./secure";
-import type { MembersMessage, PairResponse, PongMessage, HostShutdown, RelayRequest, RelayBackfill, RelayBusy, ConfigReport, ClientFrame, EnrollRequest } from "./protocol";
+import type { MembersMessage, PairResponse, PongMessage, HostShutdown, RelayRequest, RelayBackfill, RelayBusy, ConfigReport, ClientFrame, EnrollRequest, ToolCapsReport, ToolResult } from "./protocol";
 import { filterWhitelisted } from "./netStore";
 import type { SyncField } from "./protocol";
 import { randomToken, verifyPairing } from "./pairingCode";
@@ -50,6 +50,19 @@ export type HostEvents = {
      *    这样用户调整白名单立刻生效，不必等叶子重新连接。
      */
     onConfigReport?: (msg: ConfigReport, allowed: Partial<Record<SyncField, string>>) => void;
+    /**
+     * 叶子上报「我这边有哪些可远程调用的工具」（阶段 5）。
+     *
+     * 主机据此建立「工具 → 在哪台设备上」的路由表。叶子在线期间可能重复上报
+     * （重连、装了新的 MCP server），后来者覆盖前者。
+     */
+    onToolCapsReport?: (msg: ToolCapsReport) => void;
+    /**
+     * 叶子回传工具执行结果（阶段 5）。
+     *
+     * 主机按 callId 配对等待中的调用；对不上号（超时后迟到的回包）直接忽略。
+     */
+    onToolResult?: (msg: ToolResult) => void;
 };
 
 /** 一条连接上握手之后产生的全部加密状态。断开即整条丢弃。 */
@@ -616,6 +629,17 @@ export class HostServer {
                         `[net] 收到 ${msg.deviceId.slice(0, 8)} 的配置上报，但都不在同步范围内，已忽略`,
                     );
                 }
+                return;
+            }
+
+            // ── 远程工具执行（阶段 5）──
+            if (frame.type === "tool_caps_report") {
+                this.events.onToolCapsReport?.(frame as ToolCapsReport);
+                return;
+            }
+
+            if (frame.type === "tool_result") {
+                this.events.onToolResult?.(frame as ToolResult);
                 return;
             }
         });

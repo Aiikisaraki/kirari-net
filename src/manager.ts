@@ -42,7 +42,7 @@ import {
 } from "./pairingCode";
 import type { PairingCode, ExpiryKey } from "./pairingCode";
 import { NET_PORT, PROTOCOL_VERSION, SYNC_FIELDS } from "./protocol";
-import type { RelayPrompt, RelayResult, RelayBusy, RelayDelta, RelayBackfill, ConfigPush, SyncField, KbPassage } from "./protocol";
+import type { RelayPrompt, RelayResult, RelayBusy, RelayDelta, RelayBackfill, ConfigPush, SyncField, KbPassage, ToolCall, ToolCapsReport } from "./protocol";
 import { RelayRouter } from "./relayRouter";
 import type { RelayExecutor } from "./relayRouter";
 import { isNetEnabled, setNetSecret, newNetSecret } from "./secure";
@@ -100,6 +100,15 @@ export type NetManagerEvents = {
     onConfigChanged?: (patch: Partial<Record<SyncField, string>>, fromDeviceId: string) => void;
     /** 叶子收到主机下发的配置 */
     onConfigPush?: (frame: ConfigPush) => void;
+    /**
+     * 叶子侧：主机点名要本机执行一次工具调用（阶段 5）。
+     *
+     * 宿主（桌宠 / 核心版）在这里用本机的 MCP/skill 能力执行，然后
+     * **无论成功失败都要**调 manager.replyToolResult(...) 回给主机。
+     */
+    onToolCall?: (frame: ToolCall) => void;
+    /** 主机侧：某个叶子报了它有哪些可远程调用的工具（UI 可展示「这台能跑什么」） */
+    onToolCaps?: (msg: ToolCapsReport) => void;
 };
 
 /**
@@ -108,6 +117,19 @@ export type NetManagerEvents = {
  * （叶子会收到「主机还没准备好」而不是卡死）。
  */
 export type HostExecutor = RelayExecutor;
+
+/** 远程工具调用的一次结果（主机侧视角）。 */
+export type ToolCallOutcome = {
+    ok: boolean;
+    /** 成功时叶子回的结果正文 */
+    result?: string;
+    /** 失败原因 */
+    error?: string;
+    /** 实际执行的那台设备 */
+    deviceId: string;
+    /** 叶子侧执行耗时（毫秒） */
+    elapsedMs?: number;
+};
 
 export class NetManager {
     private userDataDir: string;
@@ -139,6 +161,23 @@ export class NetManager {
      * 那种调用方式本来就不消费增量，攒着只会白占内存。
      */
     private pendingDeltas = new Map<string, (chunk: string | null) => void>();
+    /**
+     * 主机侧：每台叶子自报的可远程调用工具（阶段 5）。
+     *
+     * deviceId → 能力清单。叶子重连或装了新 MCP 会重新上报，后来者覆盖。
+     * 主机据此回答「这台设备能不能跑这个工具」，避免盲目转发等超时。
+     */
+    private toolCaps = new Map<string, ToolCapsReport>();
+    /**
+     * 主机侧：已发出、等待叶子回结果的工具调用。
+     *
+     * callId → 兑现函数。与 pendingRelays 同样的道理：必须按 id 精确配对 ——
+     * 同一台设备可能同时被要求跑两个工具，只按 deviceId 配会串。
+     */
+    private pendingToolCalls = new Map<
+        string,
+        { settle: (out: ToolCallOutcome) => void; timer: ReturnType<typeof setTimeout> }
+    >();
 
     /**
      * 允许「本机没有密钥时，自己签一把」。
@@ -411,6 +450,31 @@ export class NetManager {
                         this.log(`[net] 已批准 ${msg.deviceId.slice(0, 8)} 的配置改动：${fields.join("、")}`);
                         this.broadcastConfig(allowed, msg.deviceId);
                     },
+                    // 阶段 5：叶子报了它有哪些可远程调用的工具
+                    onToolCapsReport: (msg) => {
+                        this.toolCaps.set(msg.deviceId, msg);
+                        this.events.onToolCaps?.(msg);
+                        const n = (msg.toolNames?.length ?? 0) + msg.mcpServers.length + msg.skills.length;
+                        this.log(
+                            `[net] ${msg.deviceId.slice(0, 8)} 上报可远程调用能力：` +
+                                `MCP ${msg.mcpServers.length} 个、skill ${msg.skills.length} 个` +
+                                (n ? "" : "（这台设备没有可远程调用的工具）"),
+                        );
+                    },
+                    // 阶段 5：叶子回传工具结果 → 兑现等待中的调用
+                    onToolResult: (msg) => {
+                        const waiter = this.pendingToolCalls.get(msg.callId);
+                        if (!waiter) return; // 超时后才迟到的回包，直接丢弃
+                        this.pendingToolCalls.delete(msg.callId);
+                        clearTimeout(waiter.timer);
+                        waiter.settle({
+                            ok: !!msg.ok,
+                            result: msg.result,
+                            error: msg.error,
+                            deviceId: msg.deviceId,
+                            elapsedMs: msg.elapsedMs,
+                        });
+                    },
                 },
             );
         }
@@ -445,6 +509,8 @@ export class NetManager {
             onRelayBusy: (f) => this.dispatchRelayBusy(f),
             onRelayDelta: (f) => this.dispatchRelayDelta(f),
             onConfigPush: (f) => this.events.onConfigPush?.(f),
+            // 阶段 5：主机点名要本机执行工具
+            onToolCall: (f) => this.events.onToolCall?.(f),
             // 配对期从主机学到的密钥：立刻落盘。
             // 少了这一步，重启后又变回「没有密钥的机器」，只能重新贴码 ——
             // 「贴一次码，永久无感」就断了。
@@ -713,6 +779,99 @@ export class NetManager {
         });
     }
 
+    /**
+     * 主机侧：请某台叶子在**它本地**执行一次工具调用，并等结果（阶段 5）。
+     *
+     * 这是「点明某个叶子节点，就操作那个叶子节点的 MCP/skill」的落地：
+     * 模型在主机上决策、调用参数由主机给出，但真正的执行发生在目标设备 ——
+     * 因为 MCP server / skill 都装在各节点本地，主机上没有。
+     *
+     * @param deviceId 目标设备。必须是当前在线的叶子。
+     * @param name 工具名（mcp 的 "server__tool" 或 skill 的 "skill__<id>__<tool>"）
+     * @param opts.timeoutMs 等多久算超时。默认 30s —— 工具比聊天快，等太久
+     *        只会让整轮对话卡住；超时后返回 ok:false，由上层决定降级策略。
+     */
+    callToolOnDevice(
+        deviceId: string,
+        name: string,
+        args: unknown,
+        opts: { sessionId?: string; timeoutMs?: number } = {},
+    ): Promise<ToolCallOutcome> {
+        const fail = (error: string): Promise<ToolCallOutcome> =>
+            Promise.resolve({ ok: false, error, deviceId });
+        if (this.state.role !== "host") return fail("本机不是主机，不能向叶子派发工具调用");
+        if (!this.host) return fail("主机没在运行");
+        if (!deviceId) return fail("没指定目标设备");
+        if (!name) return fail("没指定工具名");
+        // 不在线就别发 —— 发了大概率石沉大海，提前失败能给出明确原因
+        const online = this.snapshot().members?.some((m) => m.deviceId === deviceId && m.online);
+        if (!online) return fail("目标设备不在线");
+
+        const callId = randomToken(12);
+        const timeoutMs = opts.timeoutMs ?? 30000;
+        return new Promise<ToolCallOutcome>((resolve) => {
+            const timer = setTimeout(() => {
+                this.pendingToolCalls.delete(callId);
+                resolve({
+                    ok: false,
+                    error: `等 ${String(deviceId).slice(0, 8)} 执行工具超时（${Math.round(timeoutMs / 1000)} 秒）`,
+                    deviceId,
+                });
+            }, timeoutMs);
+            this.pendingToolCalls.set(callId, {
+                timer,
+                settle: (out) => resolve(out),
+            });
+            const frame: ToolCall = {
+                type: "tool_call",
+                v: PROTOCOL_VERSION,
+                callId,
+                sessionId: opts.sessionId,
+                name,
+                args,
+                timeoutMs,
+            };
+            this.host!.replyTo(deviceId, frame);
+        });
+    }
+
+    /** 主机侧：某台叶子报了哪些可远程调用的工具（没报过返回 null）。 */
+    toolCapsOf(deviceId: string): ToolCapsReport | null {
+        return this.toolCaps.get(deviceId) ?? null;
+    }
+
+    /** 主机侧：所有叶子报上来的工具能力（用于「这台设备能跑什么」的展示与路由）。 */
+    allToolCaps(): ToolCapsReport[] {
+        return [...this.toolCaps.values()];
+    }
+
+    /**
+     * 叶子侧：把一次工具执行结果回给主机（阶段 5）。
+     *
+     * ⚠️ 失败也必须回（ok:false + error）。不回主机只能等到超时，
+     *    而超时无法区分「工具报错」与「设备掉线」。
+     *
+     * 直接转发到 leaf 客户端的同名方法；不在叶子角色时返回 false。
+     */
+    replyToolResult(res: {
+        callId: string;
+        ok: boolean;
+        result?: string;
+        error?: string;
+        elapsedMs?: number;
+    }): boolean {
+        return this.leaf?.sendToolResult(res) ?? false;
+    }
+
+    /** 叶子侧：上报本机工具能力（连上主机后调用一次即可）。 */
+    reportToolCaps(caps: {
+        mcpServers: string[];
+        skills: string[];
+        toolNames?: { name: string; source: "mcp" | "skill"; owner: string }[];
+    }): boolean {
+        return this.leaf?.reportToolCaps(caps) ?? false;
+    }
+
     /** 流式增量分发：只投给注册了 onDelta 的等待者；没人等就丢弃（fire-and-forget 场景）。 */
     private dispatchRelayDelta(frame: RelayDelta): void {
         const sink = this.pendingDeltas.get(frame.requestId);
@@ -829,6 +988,13 @@ export class NetManager {
         }
         this.pendingRelays.clear();
         this.pendingDeltas.clear();
+        // 挂起的远程工具调用同理：不兑现就是永久挂住，比明确失败更糟
+        for (const waiter of this.pendingToolCalls.values()) {
+            clearTimeout(waiter.timer);
+            waiter.settle({ ok: false, error: "组网已退出，这次工具调用没能完成", deviceId: "" });
+        }
+        this.pendingToolCalls.clear();
+        this.toolCaps.clear();
     }
 }
 
